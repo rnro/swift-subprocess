@@ -10,12 +10,8 @@ on:
 jobs:
   tests:
     name: Test
-    uses: rnro/github-workflows/.github/workflows/package_test.yml@unification
+    uses: swiftlang/github-workflows/.github/workflows/package_test.yml@0.0.16
     with:
-      # A fork's default branch does not carry the change, so the ref is named.
-      # A released version needs neither input.
-      workflows_repository: rnro/github-workflows
-      workflows_ref: unification
       linux_os: '["amazonlinux2", "bookworm", "noble", "jammy", "rhel-ubi9"]'
       linux_swift_versions: '["6.2", "nightly-main"]'
       linux_setup_command: |
