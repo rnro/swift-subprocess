@@ -12,7 +12,6 @@
 #if canImport(WinSDK)
 
 @preconcurrency public import WinSDK
-internal import Dispatch
 #if canImport(System)
 import System
 #else
@@ -37,28 +36,6 @@ extension Configuration {
         outputPipe: consuming CreatedPipe,
         errorPipe: consuming CreatedPipe
     ) async throws(SubprocessError) -> SpawnResult {
-        // Spawn differently depending on whether
-        // we need to spawn as a user
-        guard let userCredentials = self.platformOptions.userCredentials else {
-            return try await self.spawnDirect(
-                withInput: inputPipe,
-                outputPipe: outputPipe,
-                errorPipe: errorPipe
-            )
-        }
-        return try await self.spawnAsUser(
-            withInput: inputPipe,
-            outputPipe: outputPipe,
-            errorPipe: errorPipe,
-            userCredentials: userCredentials
-        )
-    }
-
-    internal func spawnDirect(
-        withInput inputPipe: consuming CreatedPipe,
-        outputPipe: consuming CreatedPipe,
-        errorPipe: consuming CreatedPipe
-    ) async throws(SubprocessError) -> SpawnResult {
         let inputReadFileDescriptor: IODescriptor? = inputPipe.readFileDescriptor()
         let inputWriteFileDescriptor: IODescriptor? = inputPipe.writeFileDescriptor()
         let outputReadFileDescriptor: IODescriptor? = outputPipe.readFileDescriptor()
@@ -66,27 +43,73 @@ extension Configuration {
         let errorReadFileDescriptor: IODescriptor? = errorPipe.readFileDescriptor()
         let errorWriteFileDescriptor: IODescriptor? = errorPipe.writeFileDescriptor()
 
-        // CreateProcessW supports using `lpApplicationName` as well as `lpCommandLine` to
-        // specify executable path. However, only `lpCommandLine` supports PATH looking up,
-        // whereas `lpApplicationName` does not. In general we should rely on `lpCommandLine`'s
-        // automatic PATH lookup so we only need to call `CreateProcessW` once. However, if
-        // user wants to override executable path in arguments, we have to use `lpApplicationName`
-        // to specify the executable path. In this case, manually loop over all possible paths.
-        let possibleExecutablePaths: _OrderedSet<String>
-        if _fastPath(self.arguments.executablePathOverride == nil) {
-            // Fast path: we can rely on `CreateProcessW`'s built in Path searching
-            switch self.executable.storage {
-            case .executable(let executable):
-                possibleExecutablePaths = _OrderedSet([executable])
-            case .path(let path):
-                possibleExecutablePaths = _OrderedSet([path.string])
-            }
-        } else {
-            // Slow path: user requested arg0 override, therefore we must manually
-            // traverse through all possible executable paths
-            possibleExecutablePaths = self.executable.possibleExecutablePaths(
-                withPathValue: self.environment.pathValue()
+        // Validate the environment once before spawning. If validation fails,
+        // clean up the file descriptors before propagating the error.
+        do {
+            try self.environment.validate()
+        } catch {
+            try self.safelyCloseMultiple(
+                inputRead: inputReadFileDescriptor,
+                inputWrite: inputWriteFileDescriptor,
+                outputRead: outputReadFileDescriptor,
+                outputWrite: outputWriteFileDescriptor,
+                errorRead: errorReadFileDescriptor,
+                errorWrite: errorWriteFileDescriptor
             )
+            throw error
+        }
+
+        // Resolve the executable before spawning rather than letting
+        // `CreateProcessW` search for it. Its built-in search runs only when the
+        // executable is named on `lpCommandLine`, and it does not match the
+        // contract of `Executable.name(_:)` in two ways: it consults the
+        // directory the application loaded from, the current directory, and the
+        // system directories ahead of `PATH`, and it reads `PATH` from *this*
+        // process's environment rather than from the `lpEnvironment` block the
+        // subprocess receives. Resolving here keeps a name resolving against the
+        // subprocess's `PATH` and nothing else, on every platform.
+        //
+        // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
+        let possibleExecutablePaths: [String]
+        do {
+            switch self.executable.storage {
+            case .executable:
+                possibleExecutablePaths = try self.executable.possibleExecutablePaths(
+                    withPathValue: self.environment.pathValue()
+                ).filter {
+                    // `GetFileAttributesW` is bound by `MAX_PATH`, while
+                    // `CreateProcessW` receives a `\\?\`-prefixed path from
+                    // `withNTPathRepresentation` and is not. Leave a long
+                    // candidate for `CreateProcessW` to judge rather than
+                    // rejecting a spawn it would have accepted.
+                    $0.utf16.count >= Int(MAX_PATH) || Configuration.executableAccessible($0)
+                }
+            case .path(let path):
+                // A path is used exactly as given, so `CreateProcessW` reports
+                // whatever is wrong with it.
+                possibleExecutablePaths = [path.string]
+            }
+        } catch {
+            try self.safelyCloseMultiple(
+                inputRead: inputReadFileDescriptor,
+                inputWrite: inputWriteFileDescriptor,
+                outputRead: outputReadFileDescriptor,
+                outputWrite: outputWriteFileDescriptor,
+                errorRead: errorReadFileDescriptor,
+                errorWrite: errorWriteFileDescriptor
+            )
+            throw error
+        }
+
+        // Create the Job Object up front. It persists across all candidate path
+        // attempts, and is owned by this function until ownership transfers to
+        // the `ProcessIdentifier` on the success path.
+        let jobHandle = try Self.createJobObject()
+        var jobHandleOwned = true
+        defer {
+            if jobHandleOwned {
+                _ = CloseHandle(jobHandle)
+            }
         }
 
         for executablePath in possibleExecutablePaths {
@@ -115,263 +138,109 @@ extension Configuration {
 
             var createProcessFlags = self.generateCreateProcessFlag()
 
-            let (created, processInfo, windowsError) = try await self.withStartupInfoEx(
-                inputRead: inputReadFileDescriptor,
-                inputWrite: inputWriteFileDescriptor,
-                outputRead: outputReadFileDescriptor,
-                outputWrite: outputWriteFileDescriptor,
-                errorRead: errorReadFileDescriptor,
-                errorWrite: errorWriteFileDescriptor
-            ) { startupInfo throws(SubprocessError) in
-                // Give calling process a chance to modify flag and startup info
-                if let configurator = self.platformOptions.preSpawnProcessConfigurator {
-                    try configurator(&createProcessFlags, &startupInfo.pointer(to: \.StartupInfo)!.pointee)
-                }
-
-                // Spawn!
-                let spawnContext = SpawnContext(
-                    startupInfo: startupInfo,
-                    createProcessFlags: createProcessFlags
-                )
-                return try await runOnBackgroundThread { () throws(SubprocessError) in
-                    return try applicationName.withOptionalNTPathRepresentation { applicationNameW throws(SubprocessError) in
-                        try commandAndArgs._withCString(
-                            encodedAs: UTF16.self
-                        ) { commandAndArgsW throws(SubprocessError) in
-                            try environment._withCString(
-                                encodedAs: UTF16.self
-                            ) { environmentW throws(SubprocessError) in
-                                try intendedWorkingDir.withOptionalNTPathRepresentation { intendedWorkingDirW throws(SubprocessError) in
-                                    var processInfo = PROCESS_INFORMATION()
-                                    let result = CreateProcessW(
-                                        applicationNameW,
-                                        UnsafeMutablePointer<WCHAR>(mutating: commandAndArgsW),
-                                        nil, // lpProcessAttributes
-                                        nil, // lpThreadAttributes
-                                        true, // bInheritHandles
-                                        spawnContext.createProcessFlags,
-                                        UnsafeMutableRawPointer(mutating: environmentW),
-                                        intendedWorkingDirW,
-                                        spawnContext.startupInfo.pointer(to: \.StartupInfo)!,
-                                        &processInfo
-                                    )
-                                    return (result, processInfo, GetLastError())
-                                }
-                            }
-                        }
+            let (created, processInfo, windowsError, userManagesResume): (Bool, PROCESS_INFORMATION, DWORD, Bool)
+            do {
+                (created, processInfo, windowsError, userManagesResume) = try await self.withStartupInfoEx(
+                    inputRead: inputReadFileDescriptor,
+                    inputWrite: inputWriteFileDescriptor,
+                    outputRead: outputReadFileDescriptor,
+                    outputWrite: outputWriteFileDescriptor,
+                    errorRead: errorReadFileDescriptor,
+                    errorWrite: errorWriteFileDescriptor
+                ) { startupInfo throws(SubprocessError) in
+                    // Give calling process a chance to modify flag and startup info
+                    if let configurator = self.platformOptions.preSpawnProcessConfigurator {
+                        try configurator(&createProcessFlags, &startupInfo.pointer(to: \.StartupInfo)!.pointee)
                     }
-                }
-            }
 
-            guard created else {
-                if windowsError == ERROR_FILE_NOT_FOUND || windowsError == ERROR_PATH_NOT_FOUND {
-                    // This execution path is not it. Try the next one
-                    continue
-                }
+                    // If the configurator set `CREATE_SUSPENDED`, the user has
+                    // explicitly opted into managing the child's initial
+                    // resume themselves. Otherwise, Subprocess resumes the
+                    // child after assigning it to the Job Object.
+                    let userManagesResume = (createProcessFlags & DWORD(CREATE_SUSPENDED)) != 0
 
-                try self.safelyCloseMultiple(
-                    inputRead: inputReadFileDescriptor,
-                    inputWrite: inputWriteFileDescriptor,
-                    outputRead: outputReadFileDescriptor,
-                    outputWrite: outputWriteFileDescriptor,
-                    errorRead: errorReadFileDescriptor,
-                    errorWrite: errorWriteFileDescriptor
-                )
+                    // Subprocess assigns every spawned child to a Job Object
+                    // before any user code runs in the child. `CREATE_SUSPENDED`
+                    // makes the assignment atomic, so it is always set
+                    // regardless of what the configurator did.
+                    createProcessFlags |= DWORD(CREATE_SUSPENDED)
 
-                // Match Darwin and Linux behavior and throw
-                // .failedToChangeWorkingDirectory instead of .spawnFailed
-                if windowsError == ERROR_DIRECTORY {
-                    throw SubprocessError.failedToChangeWorkingDirectory(
-                        self.workingDirectory?.string,
-                        underlyingError: SubprocessError.WindowsError(rawValue: windowsError)
+                    let spawnContext = SpawnContext(
+                        startupInfo: startupInfo,
+                        createProcessFlags: createProcessFlags
                     )
-                }
-
-                throw SubprocessError.spawnFailed(
-                    withUnderlyingError: SubprocessError.WindowsError(rawValue: windowsError)
-                )
-            }
-
-            let pid = ProcessIdentifier(
-                value: processInfo.dwProcessId,
-                processDescriptor: processInfo.hProcess,
-                threadHandle: processInfo.hThread
-            )
-            let execution = Execution(
-                processIdentifier: pid
-            )
-
-            do {
-                // After spawn finishes, close all child side fds
-                try self.safelyCloseMultiple(
-                    inputRead: inputReadFileDescriptor,
-                    inputWrite: nil,
-                    outputRead: nil,
-                    outputWrite: outputWriteFileDescriptor,
-                    errorRead: nil,
-                    errorWrite: errorWriteFileDescriptor
-                )
-            } catch {
-                // If spawn() throws, monitorProcessTermination
-                // won't have an opportunity to call release, so do it here to avoid leaking the handles.
-                pid.close()
-                throw error
-            }
-
-            return SpawnResult(
-                execution: execution,
-                inputWriteEnd: inputWriteFileDescriptor?.createIOChannel(),
-                outputReadEnd: outputReadFileDescriptor?.createIOChannel(),
-                errorReadEnd: errorReadFileDescriptor?.createIOChannel()
-            )
-        }
-
-        try self.safelyCloseMultiple(
-            inputRead: inputReadFileDescriptor,
-            inputWrite: inputWriteFileDescriptor,
-            outputRead: outputReadFileDescriptor,
-            outputWrite: outputWriteFileDescriptor,
-            errorRead: errorReadFileDescriptor,
-            errorWrite: errorWriteFileDescriptor
-        )
-
-        // If we reached this point, all possible executable paths have failed
-        throw SubprocessError.executableNotFound(
-            self.executable.description,
-            underlyingError: SubprocessError.WindowsError(rawValue: DWORD(ERROR_FILE_NOT_FOUND))
-        )
-    }
-
-    internal func spawnAsUser(
-        withInput inputPipe: consuming CreatedPipe,
-        outputPipe: consuming CreatedPipe,
-        errorPipe: consuming CreatedPipe,
-        userCredentials: PlatformOptions.UserCredentials
-    ) async throws(SubprocessError) -> SpawnResult {
-        var inputPipeBox: CreatedPipe? = consume inputPipe
-        var outputPipeBox: CreatedPipe? = consume outputPipe
-        var errorPipeBox: CreatedPipe? = consume errorPipe
-
-        var _inputPipe = inputPipeBox.take()!
-        var _outputPipe = outputPipeBox.take()!
-        var _errorPipe = errorPipeBox.take()!
-
-        let inputReadFileDescriptor: IODescriptor? = _inputPipe.readFileDescriptor()
-        let inputWriteFileDescriptor: IODescriptor? = _inputPipe.writeFileDescriptor()
-        let outputReadFileDescriptor: IODescriptor? = _outputPipe.readFileDescriptor()
-        let outputWriteFileDescriptor: IODescriptor? = _outputPipe.writeFileDescriptor()
-        let errorReadFileDescriptor: IODescriptor? = _errorPipe.readFileDescriptor()
-        let errorWriteFileDescriptor: IODescriptor? = _errorPipe.writeFileDescriptor()
-
-        // CreateProcessW supports using `lpApplicationName` as well as `lpCommandLine` to
-        // specify executable path. However, only `lpCommandLine` supports PATH looking up,
-        // whereas `lpApplicationName` does not. In general we should rely on `lpCommandLine`'s
-        // automatic PATH lookup so we only need to call `CreateProcessW` once. However, if
-        // user wants to override executable path in arguments, we have to use `lpApplicationName`
-        // to specify the executable path. In this case, manually loop over all possible paths.
-        let possibleExecutablePaths: _OrderedSet<String>
-        if _fastPath(self.arguments.executablePathOverride == nil) {
-            // Fast path: we can rely on `CreateProcessW`'s built in Path searching
-            switch self.executable.storage {
-            case .executable(let executable):
-                possibleExecutablePaths = _OrderedSet([executable])
-            case .path(let path):
-                possibleExecutablePaths = _OrderedSet([path.string])
-            }
-        } else {
-            // Slow path: user requested arg0 override, therefore we must manually
-            // traverse through all possible executable paths
-            possibleExecutablePaths = self.executable.possibleExecutablePaths(
-                withPathValue: self.environment.pathValue()
-            )
-        }
-        for executablePath in possibleExecutablePaths {
-            let (
-                applicationName,
-                commandAndArgs,
-                environment,
-                intendedWorkingDir
-            ): (String?, String, String, String?)
-            do {
-                (
-                    applicationName,
-                    commandAndArgs,
-                    environment,
-                    intendedWorkingDir
-                ) = try self.preSpawn(withPossibleExecutablePath: executablePath)
-            } catch {
-                try self.safelyCloseMultiple(
-                    inputRead: inputReadFileDescriptor,
-                    inputWrite: inputWriteFileDescriptor,
-                    outputRead: outputReadFileDescriptor,
-                    outputWrite: outputWriteFileDescriptor,
-                    errorRead: errorReadFileDescriptor,
-                    errorWrite: errorWriteFileDescriptor
-                )
-                throw error
-            }
-
-            var createProcessFlags = self.generateCreateProcessFlag()
-
-            let (created, processInfo, windowsError) = try await self.withStartupInfoEx(
-                inputRead: inputReadFileDescriptor,
-                inputWrite: inputWriteFileDescriptor,
-                outputRead: outputReadFileDescriptor,
-                outputWrite: outputWriteFileDescriptor,
-                errorRead: errorReadFileDescriptor,
-                errorWrite: errorWriteFileDescriptor
-            ) { startupInfo throws(SubprocessError) in
-                // Give calling process a chance to modify flag and startup info
-                if let configurator = self.platformOptions.preSpawnProcessConfigurator {
-                    try configurator(&createProcessFlags, &startupInfo.pointer(to: \.StartupInfo)!.pointee)
-                }
-
-                let spawnContext = SpawnContext(
-                    startupInfo: startupInfo,
-                    createProcessFlags: createProcessFlags
-                )
-                // Spawn (featuring pyramid!)
-                return try await runOnBackgroundThread { () throws(SubprocessError) in
-                    return try userCredentials.username._withCString(
-                        encodedAs: UTF16.self
-                    ) { usernameW throws(SubprocessError) in
-                        try userCredentials.password._withCString(
-                            encodedAs: UTF16.self
-                        ) { passwordW throws(SubprocessError) in
-                            try userCredentials.domain.withOptionalCString(
+                    // Spawn (featuring pyramid!)
+                    return try await runOnBackgroundThread { () throws(SubprocessError) in
+                        try applicationName.withOptionalNTPathRepresentation { applicationNameW throws(SubprocessError) in
+                            try commandAndArgs._withCString(
                                 encodedAs: UTF16.self
-                            ) { domainW throws(SubprocessError) in
-                                try applicationName.withOptionalNTPathRepresentation { applicationNameW throws(SubprocessError) in
-                                    try commandAndArgs._withCString(
-                                        encodedAs: UTF16.self
-                                    ) { commandAndArgsW throws(SubprocessError) in
-                                        try environment._withCString(
-                                            encodedAs: UTF16.self
-                                        ) { environmentW throws(SubprocessError) in
-                                            try intendedWorkingDir.withOptionalNTPathRepresentation { intendedWorkingDirW throws(SubprocessError) in
-                                                var processInfo = PROCESS_INFORMATION()
-                                                let created = CreateProcessWithLogonW(
-                                                    usernameW,
-                                                    domainW,
-                                                    passwordW,
-                                                    DWORD(LOGON_WITH_PROFILE),
-                                                    applicationNameW,
-                                                    UnsafeMutablePointer<WCHAR>(mutating: commandAndArgsW),
-                                                    spawnContext.createProcessFlags,
-                                                    UnsafeMutableRawPointer(mutating: environmentW),
-                                                    intendedWorkingDirW,
-                                                    spawnContext.startupInfo.pointer(to: \.StartupInfo)!,
-                                                    &processInfo
-                                                )
-                                                return (created, processInfo, GetLastError())
+                            ) { commandAndArgsW throws(SubprocessError) in
+                                try environment._withCString(
+                                    encodedAs: UTF16.self
+                                ) { environmentW throws(SubprocessError) in
+                                    try intendedWorkingDir.withOptionalNTPathRepresentation { intendedWorkingDirW throws(SubprocessError) in
+                                        // Spawn differently depending on whether
+                                        // we need to spawn as a user
+                                        if let userCredentials = self.platformOptions.userCredentials {
+                                            return try userCredentials.username._withCString(
+                                                encodedAs: UTF16.self
+                                            ) { usernameW throws(SubprocessError) in
+                                                try userCredentials.password._withCString(
+                                                    encodedAs: UTF16.self
+                                                ) { passwordW throws(SubprocessError) in
+                                                    try userCredentials.domain.withOptionalCString(
+                                                        encodedAs: UTF16.self
+                                                    ) { domainW throws(SubprocessError) in
+                                                        var processInfo = PROCESS_INFORMATION()
+                                                        let created = CreateProcessWithLogonW(
+                                                            usernameW,
+                                                            domainW,
+                                                            passwordW,
+                                                            DWORD(LOGON_WITH_PROFILE),
+                                                            applicationNameW,
+                                                            UnsafeMutablePointer<WCHAR>(mutating: commandAndArgsW),
+                                                            spawnContext.createProcessFlags,
+                                                            UnsafeMutableRawPointer(mutating: environmentW),
+                                                            intendedWorkingDirW,
+                                                            spawnContext.startupInfo.pointer(to: \.StartupInfo)!,
+                                                            &processInfo
+                                                        )
+                                                        return (created, processInfo, GetLastError(), userManagesResume)
+                                                    }
+                                                }
                                             }
                                         }
+
+                                        var processInfo = PROCESS_INFORMATION()
+                                        let result = CreateProcessW(
+                                            applicationNameW,
+                                            UnsafeMutablePointer<WCHAR>(mutating: commandAndArgsW),
+                                            nil, // lpProcessAttributes
+                                            nil, // lpThreadAttributes
+                                            true, // bInheritHandles
+                                            spawnContext.createProcessFlags,
+                                            UnsafeMutableRawPointer(mutating: environmentW),
+                                            intendedWorkingDirW,
+                                            spawnContext.startupInfo.pointer(to: \.StartupInfo)!,
+                                            &processInfo
+                                        )
+                                        return (result, processInfo, GetLastError(), userManagesResume)
                                     }
                                 }
                             }
                         }
                     }
                 }
+            } catch {
+                try self.safelyCloseMultiple(
+                    inputRead: inputReadFileDescriptor,
+                    inputWrite: inputWriteFileDescriptor,
+                    outputRead: outputReadFileDescriptor,
+                    outputWrite: outputWriteFileDescriptor,
+                    errorRead: errorReadFileDescriptor,
+                    errorWrite: errorWriteFileDescriptor
+                )
+                throw error
             }
 
             guard created else {
@@ -380,6 +249,18 @@ extension Configuration {
                     continue
                 }
 
+                // `CreateProcessW` reports ERROR_ACCESS_DENIED when the path
+                // names a directory, so a directory sharing the executable's
+                // name would otherwise fail the spawn outright instead of
+                // falling through to the remaining candidates. A directory is
+                // never runnable, so treat it as a miss. Genuine permission
+                // failures on a real file still throw below.
+                if windowsError == DWORD(ERROR_ACCESS_DENIED),
+                    Configuration.isDirectory(executablePath)
+                {
+                    continue
+                }
+
                 try self.safelyCloseMultiple(
                     inputRead: inputReadFileDescriptor,
                     inputWrite: inputWriteFileDescriptor,
@@ -388,27 +269,47 @@ extension Configuration {
                     errorRead: errorReadFileDescriptor,
                     errorWrite: errorWriteFileDescriptor
                 )
+
                 // Match Darwin and Linux behavior and throw
                 // .failedToChangeWorkingDirectory instead of .spawnFailed
                 if windowsError == ERROR_DIRECTORY {
                     throw SubprocessError.failedToChangeWorkingDirectory(
                         self.workingDirectory?.string,
-                        underlyingError: SubprocessError.WindowsError(rawValue: windowsError)
+                        underlyingError: SubprocessError.WindowsError(win32Error: windowsError)
                     )
                 }
 
                 throw SubprocessError.spawnFailed(
-                    withUnderlyingError: SubprocessError.WindowsError(rawValue: windowsError)
+                    withUnderlyingError: SubprocessError.WindowsError(win32Error: windowsError)
                 )
             }
+
+            do {
+                try Self.assignChildToJobObjectAndResume(
+                    jobHandle: jobHandle,
+                    processInfo: processInfo,
+                    resumeThread: !userManagesResume
+                )
+            } catch {
+                try self.safelyCloseMultiple(
+                    inputRead: inputReadFileDescriptor,
+                    inputWrite: inputWriteFileDescriptor,
+                    outputRead: outputReadFileDescriptor,
+                    outputWrite: outputWriteFileDescriptor,
+                    errorRead: errorReadFileDescriptor,
+                    errorWrite: errorWriteFileDescriptor
+                )
+                throw error
+            }
+
+            // Transfer ownership of the job handle to the `ProcessIdentifier`.
+            jobHandleOwned = false
 
             let pid = ProcessIdentifier(
                 value: processInfo.dwProcessId,
                 processDescriptor: processInfo.hProcess,
-                threadHandle: processInfo.hThread
-            )
-            let execution = Execution(
-                processIdentifier: pid
+                threadHandle: processInfo.hThread,
+                jobHandle: jobHandle
             )
 
             do {
@@ -429,10 +330,10 @@ extension Configuration {
             }
 
             return SpawnResult(
-                execution: execution,
-                inputWriteEnd: inputWriteFileDescriptor?.createIOChannel(),
-                outputReadEnd: outputReadFileDescriptor?.createIOChannel(),
-                errorReadEnd: errorReadFileDescriptor?.createIOChannel()
+                processIdentifier: pid,
+                inputWriteEnd: inputWriteFileDescriptor,
+                outputReadEnd: outputReadFileDescriptor,
+                errorReadEnd: errorReadFileDescriptor
             )
         }
 
@@ -445,10 +346,23 @@ extension Configuration {
             errorWrite: errorWriteFileDescriptor
         )
 
-        // If we reached this point, all possible executable paths have failed
+        // If we reached this point, all possible executable paths have failed.
+        // When a name resolved to nothing at all, `CreateProcessW` never ran and
+        // so never reported an unusable working directory. Check it here, so the
+        // error names the problem the caller can act on this is the same best-effort
+        // guess the Unix spawn path makes.
+        if let workingDirectory = self.workingDirectory?.string,
+            !Configuration.isDirectory(workingDirectory)
+        {
+            throw SubprocessError.failedToChangeWorkingDirectory(
+                workingDirectory,
+                underlyingError: SubprocessError.WindowsError(win32Error: DWORD(ERROR_DIRECTORY))
+            )
+        }
+
         throw SubprocessError.executableNotFound(
             self.executable.description,
-            underlyingError: SubprocessError.WindowsError(rawValue: DWORD(ERROR_FILE_NOT_FOUND))
+            underlyingError: SubprocessError.WindowsError(win32Error: DWORD(ERROR_FILE_NOT_FOUND))
         )
     }
 }
@@ -458,9 +372,9 @@ extension Configuration {
 /// The collection of platform-specific settings
 /// to configure the subprocess when running.
 public struct PlatformOptions: Sendable {
-    /// The credentials to use when spawning the subprocess
+    /// The credentials to use when launching the subprocess
     /// as a different user.
-    public struct UserCredentials: Sendable, Hashable {
+    internal struct UserCredentials: Sendable, Hashable {
         /// The name of the user.
         ///
         /// This is the name of the user account to run as.
@@ -472,8 +386,8 @@ public struct PlatformOptions: Sendable {
         public var domain: String?
     }
 
-    /// `ConsoleBehavior` describes how the console appears
-    /// when spawning a new process.
+    /// Describes how the console appears
+    /// when launching a new process.
     public struct ConsoleBehavior: Sendable, Hashable {
         internal enum Storage: Sendable, Hashable {
             case createNew
@@ -488,19 +402,20 @@ public struct PlatformOptions: Sendable {
         }
 
         /// The subprocess has a new console, instead of
-        /// inheriting its parent's console (the default).
+        /// inheriting the calling process's console (the default).
         public static let createNew: Self = .init(.createNew)
         /// For console processes, the new process does not
-        /// inherit its parent's console (the default).
+        /// inherit the calling process's console (the default).
+        ///
         /// The new process can call the `AllocConsole`
         /// function at a later time to create a console.
         public static let detach: Self = .init(.detach)
-        /// The subprocess inherits its parent's console.
+        /// The subprocess inherits the calling process's console.
         public static let inherit: Self = .init(.inherit)
     }
 
-    /// `WindowStyle` describes how the window appears
-    /// when spawning a new process.
+    /// Describes how the window appears
+    /// when launching a new process.
     public struct WindowStyle: Sendable, Hashable {
         internal enum Storage: Sendable, Hashable {
             case normal
@@ -535,10 +450,10 @@ public struct PlatformOptions: Sendable {
     }
 
     /// The user credentials for starting the process as another user.
-    public var userCredentials: UserCredentials? = nil
+    internal var userCredentials: UserCredentials? = nil
     /// The console behavior of the new process.
     ///
-    /// Defaults to inheriting the console from the parent process.
+    /// Defaults to inheriting the console from the calling process.
     public var consoleBehavior: ConsoleBehavior = .inherit
     /// The window style to use when the process starts.
     public var windowStyle: WindowStyle = .normal
@@ -546,29 +461,47 @@ public struct PlatformOptions: Sendable {
     /// group for the new process.
     ///
     /// The process group includes all processes
-    /// that are descendants of this root process.
+    /// that this root process launches, directly or indirectly.
     /// The process identifier of the new process group
     /// is the same as the process identifier.
     public var createProcessGroup: Bool = false
-    /// An ordered list of steps to tear down the child
-    /// process if the parent task is canceled before
-    /// the child process terminates.
+    /// An ordered list of steps to tear down the subprocess
+    /// if the calling task is canceled before
+    /// the subprocess terminates.
     ///
     /// The sequence always ends by forcefully terminating the process.
     public var teardownSequence: [TeardownStep] = []
     /// A closure that configures platform-specific
-    /// spawning constructs.
+    /// process-launching constructs.
     ///
     /// Use this closure to directly configure or override
-    /// the underlying platform-specific spawn settings that the
+    /// the underlying platform-specific launch settings that the
     /// library uses internally, when higher-level APIs aren't
     /// available for such modifications.
     ///
     /// On Windows, Subprocess uses `CreateProcessW()` as the
-    /// underlying spawning mechanism. This closure allows
+    /// underlying process-launching mechanism. This closure allows
     /// modification of the `dwCreationFlags` creation flag
     /// and startup info `STARTUPINFOW` before
     /// they are sent to `CreateProcessW()`.
+    ///
+    /// - Important: Subprocess assigns every launched subprocess to
+    /// an internal Job Object before any user code runs in the subprocess,
+    /// so teardown sequences targeting the process group can terminate
+    /// the subprocess and everything it launches together. To make this
+    /// assignment atomic, Subprocess always launches subprocesses with
+    /// `CREATE_SUSPENDED` set in `dwCreationFlags`, regardless of the
+    /// value the configurator leaves in `dwCreationFlags`. By default,
+    /// Subprocess resumes the subprocess after the assignment completes.
+    /// If the configurator sets `CREATE_SUSPENDED` in `dwCreationFlags`,
+    /// Subprocess treats this as a signal that user code will resume
+    /// the subprocess explicitly, and therefore skips the internal `ResumeThread`
+    /// call. In that case the caller is responsible for calling
+    /// `ResumeThread` on the thread handle exposed through
+    /// `Execution.processIdentifier.threadHandle`. Otherwise, the subprocess
+    /// will remain suspended indefinitely. If user code separately
+    /// assigns the subprocess to its own Job Object after launch, that
+    /// user-supplied job is nested inside Subprocess's job.
     public var preSpawnProcessConfigurator:
         (
             @Sendable (
@@ -581,14 +514,58 @@ public struct PlatformOptions: Sendable {
     public init() {}
 }
 
+extension PlatformOptions.ConsoleBehavior: CustomStringConvertible, CustomDebugStringConvertible {
+    /// A textual representation of how the console appears when launching a
+    /// new process.
+    public var description: String {
+        switch self.storage {
+        case .createNew:
+            return "createNew"
+        case .detach:
+            return "detach"
+        case .inherit:
+            return "inherit"
+        }
+    }
+
+    /// A debug-oriented textual representation of how the console appears when
+    /// launching a new process.
+    public var debugDescription: String {
+        return self.description
+    }
+}
+
+extension PlatformOptions.WindowStyle: CustomStringConvertible, CustomDebugStringConvertible {
+    /// A textual representation of how the window appears when launching a
+    /// new process.
+    public var description: String {
+        switch self.storage {
+        case .normal:
+            return "normal"
+        case .hidden:
+            return "hidden"
+        case .maximized:
+            return "maximized"
+        case .minimized:
+            return "minimized"
+        }
+    }
+
+    /// A debug-oriented textual representation of how the window appears when
+    /// launching a new process.
+    public var debugDescription: String {
+        return self.description
+    }
+}
+
 extension PlatformOptions: CustomStringConvertible, CustomDebugStringConvertible {
     internal func description(withIndent indent: Int) -> String {
         let indent = String(repeating: " ", count: indent * 4)
         return """
             PlatformOptions(
             \(indent)    userCredentials: \(String(describing: self.userCredentials)),
-            \(indent)    consoleBehavior: \(String(describing: self.consoleBehavior)),
-            \(indent)    windowStyle: \(String(describing: self.windowStyle)),
+            \(indent)    consoleBehavior: \(self.consoleBehavior),
+            \(indent)    windowStyle: \(self.windowStyle),
             \(indent)    createProcessGroup: \(self.createProcessGroup),
             \(indent)    preSpawnProcessConfigurator: \(self.preSpawnProcessConfigurator == nil ? "not set" : "set")
             \(indent))
@@ -608,9 +585,9 @@ extension PlatformOptions: CustomStringConvertible, CustomDebugStringConvertible
 
 // MARK: - Process Monitoring
 @Sendable
-internal func monitorProcessTermination(
+internal func waitForProcessTermination(
     for processIdentifier: ProcessIdentifier
-) async throws(SubprocessError) -> TerminationStatus {
+) async throws(SubprocessError) {
     // Once the continuation resumes, it will need to unregister the wait, so
     // yield the wait handle back to the calling scope.
     var waitHandle: HANDLE?
@@ -645,7 +622,7 @@ internal func monitorProcessTermination(
                 )
             else {
                 let error: SubprocessError = .failedToMonitor(
-                    withUnderlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                    withUnderlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
                 )
                 continuation.resume(
                     throwing: error
@@ -654,11 +631,19 @@ internal func monitorProcessTermination(
             }
         }
     }
+}
 
+@Sendable
+internal func reapProcess(
+    with processIdentifier: ProcessIdentifier
+) throws(SubprocessError) -> TerminationStatus {
+    // Windows keeps the exit code reachable through the process HANDLE
+    // until the HANDLE is closed, so there is no zombie to reap. We just
+    // need to read the exit code via `GetExitCodeProcess`.
     var status: DWORD = 0
     guard GetExitCodeProcess(processIdentifier.processDescriptor, &status) else {
         throw SubprocessError.failedToMonitor(
-            withUnderlyingError: .init(rawValue: GetLastError())
+            withUnderlyingError: .init(win32Error: GetLastError())
         )
     }
 
@@ -668,18 +653,36 @@ internal func monitorProcessTermination(
 // MARK: - Subprocess Control
 
 extension Execution {
-    /// Terminate the current subprocess with the given exit code
-    /// - Parameter exitCode: The exit code to use for the subprocess.
-    public func terminate(withExitCode exitCode: DWORD) throws(SubprocessError) {
-        guard TerminateProcess(self.processIdentifier.processDescriptor, exitCode) else {
-            throw SubprocessError.processControlFailed(
-                .terminate,
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
-            )
+    /// Terminates the current subprocess with the exit code you provide.
+    /// - Parameters:
+    ///   - exitCode: The exit code to use for the subprocess.
+    ///   - toProcessGroup: When `true`, terminates the subprocess and everything
+    ///   it launches by terminating the Job Object that contains them. The
+    ///   exit code is propagated to every process in the job. When `false`
+    ///   (the default), terminates only the immediate subprocess, leaving
+    ///   the processes it launched unaffected.
+    public func terminate(
+        withExitCode exitCode: DWORD,
+        toProcessGroup: Bool = false
+    ) throws(SubprocessError) {
+        if toProcessGroup {
+            guard TerminateJobObject(self.processIdentifier.jobHandle, exitCode) else {
+                throw SubprocessError.processControlFailed(
+                    .terminate,
+                    underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
+                )
+            }
+        } else {
+            guard TerminateProcess(self.processIdentifier.processDescriptor, exitCode) else {
+                throw SubprocessError.processControlFailed(
+                    .terminate,
+                    underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
+                )
+            }
         }
     }
 
-    /// Suspend the current subprocess
+    /// Suspends the current subprocess.
     public func suspend() throws(SubprocessError) {
         let NTSuspendProcess: (@convention(c) (HANDLE) -> LONG)? =
             unsafeBitCast(
@@ -692,18 +695,18 @@ extension Execution {
         guard let NTSuspendProcess = NTSuspendProcess else {
             throw SubprocessError.processControlFailed(
                 .suspend,
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
             )
         }
         guard NTSuspendProcess(self.processIdentifier.processDescriptor) >= 0 else {
             throw SubprocessError.processControlFailed(
                 .suspend,
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
             )
         }
     }
 
-    /// Resume the current subprocess after suspension
+    /// Resumes the current subprocess after suspension.
     public func resume() throws(SubprocessError) {
         let NTResumeProcess: (@convention(c) (HANDLE) -> LONG)? =
             unsafeBitCast(
@@ -716,13 +719,13 @@ extension Execution {
         guard let NTResumeProcess = NTResumeProcess else {
             throw SubprocessError.processControlFailed(
                 .resume,
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
             )
         }
         guard NTResumeProcess(self.processIdentifier.processDescriptor) >= 0 else {
             throw SubprocessError.processControlFailed(
                 .resume,
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
             )
         }
     }
@@ -730,189 +733,110 @@ extension Execution {
 
 // MARK: - Executable Searching
 extension Executable {
-    // Technically not needed for CreateProcess since
-    // it takes process name. It's here to support
-    // Executable.resolveExecutablePath
+    /// The directories searched when neither the environment passed to the
+    /// subprocess nor the current process defines `PATH`.
+    ///
+    /// Windows has no `confstr(_CS_PATH)` to ask. The closest equivalent is the
+    /// set of directories `CreateProcessW` searches by itself, so those are
+    /// queried here, in the order it documents: the directory the application
+    /// loaded from, the 32-bit system directory, the 16-bit system directory,
+    /// and the Windows directory.
+    ///
+    /// The one step of that order deliberately left out is "the current
+    /// directory for the calling process". ``Executable/name(_:)`` never
+    /// searches a current directory to avoid potential  security issues.
+    ///
+    /// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
+    internal static let defaultSearchPaths: [String] = {
+        var directories: [String] = []
+
+        // 1. The directory from which the application loaded.
+        let applicationPath = try? fillNullTerminatedWideStringBuffer(
+            initialSize: DWORD(MAX_PATH),
+            maxSize: DWORD(Int16.max)
+        ) {
+            return GetModuleFileNameW(nil, $0.baseAddress, DWORD($0.count))
+        }
+        if let applicationPath {
+            directories.append(FilePath(applicationPath).removingLastComponent().string)
+        }
+
+        // 2. The 32-bit Windows system directory.
+        let systemDirectorySize = GetSystemDirectoryW(nil, 0)
+        let systemDirectory = try? fillNullTerminatedWideStringBuffer(
+            initialSize: systemDirectorySize,
+            maxSize: DWORD(Int16.max)
+        ) {
+            return GetSystemDirectoryW($0.baseAddress, DWORD($0.count))
+        }
+        if let systemDirectory {
+            directories.append(systemDirectory)
+        }
+
+        let windowsDirectorySize = GetWindowsDirectoryW(nil, 0)
+        let windowsDirectory = try? fillNullTerminatedWideStringBuffer(
+            initialSize: windowsDirectorySize,
+            maxSize: DWORD(Int16.max)
+        ) {
+            return GetWindowsDirectoryW($0.baseAddress, DWORD($0.count))
+        }
+        if let windowsDirectory {
+            // 3. The 16-bit Windows system directory. Windows documentation
+            // states that "No such standard function (similar to
+            // GetSystemDirectory) exists for the 16-bit system folder", so use
+            // "\(windowsDirectory)\System" instead.
+            directories.append(FilePath(windowsDirectory).appending("System").string)
+            // 4. The Windows directory.
+            directories.append(windowsDirectory)
+        }
+
+        // Filtered the way a `PATH` value is, so the absolute-only rule holds
+        // however the system answered.
+        return directories.filter { FilePath($0).isAbsolute }
+    }()
+
     internal func resolveExecutablePath(withPathValue pathValue: String?) throws(SubprocessError) -> String {
         switch self.storage {
         case .executable(let executableName):
-            return try executableName._withCString(
-                encodedAs: UTF16.self
-            ) { exeName throws(SubprocessError) -> String in
-                return try pathValue.withOptionalCString(
-                    encodedAs: UTF16.self
-                ) { path throws(SubprocessError) -> String in
-                    let pathLength = SearchPathW(
-                        path,
-                        exeName,
-                        nil,
-                        0,
-                        nil,
-                        nil
-                    )
-                    guard pathLength > 0 else {
-                        throw SubprocessError.executableNotFound(
-                            executableName,
-                            underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
-                        )
-                    }
-                    return withUnsafeTemporaryAllocation(
-                        of: WCHAR.self,
-                        capacity: Int(pathLength) + 1
-                    ) {
-                        _ = SearchPathW(
-                            path,
-                            exeName,
-                            nil,
-                            pathLength + 1,
-                            $0.baseAddress,
-                            nil
-                        )
-                        return String(decodingCString: $0.baseAddress!, as: UTF16.self)
-                    }
-                }
+            let firstAccessibleExecutable = try possibleExecutablePaths(withPathValue: pathValue)
+                .first { Configuration.executableAccessible($0) }
+            if let firstAccessibleExecutable {
+                return firstAccessibleExecutable
             }
+            throw SubprocessError.executableNotFound(
+                executableName,
+                underlyingError: SubprocessError.WindowsError(win32Error: DWORD(ERROR_FILE_NOT_FOUND))
+            )
         case .path(let executablePath):
             // Use path directly
             return executablePath.string
         }
     }
 
-    /// `CreateProcessW` allows users to specify the executable path via
-    /// `lpApplicationName` or via `lpCommandLine`. However, only `lpCommandLine` supports
-    /// path searching, whereas `lpApplicationName` does not. In order to support the
-    /// "argument 0 override" feature, Subprocess must use `lpApplicationName` instead of
-    /// relying on `lpCommandLine` (so we can potentially set a different value for `lpCommandLine`).
+    /// The paths to try, in order, for this executable.
     ///
-    /// This method replicates the executable searching behavior of `CreateProcessW`'s
-    /// `lpCommandLine`. Specifically, it follows the steps listed in `CreateProcessW`'s documentation:
+    /// A name is joined to each directory returned by
+    /// `Executable.searchPaths(withPathValue:)`, and only to those: unlike
+    /// `CreateProcessW`'s own search, the directory the application loaded
+    /// from, the current directory, and the system directories are not
+    /// consulted, and the `PATH` that is walked is the subprocess's rather than
+    /// this process's. See ``Executable/name(_:)`` for the contract this implements.
     ///
-    /// 1. The directory from which the application loaded.
-    /// 2. The current directory for the parent process.
-    /// 3. The 32-bit Windows system directory.
-    /// 4. The 16-bit Windows system directory.
-    /// 5. The Windows directory.
-    /// 6. The directories that are listed in the PATH environment variable.
-    ///
-    /// For more info:
-    /// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
+    /// Each directory is tried with every extension in `PATHEXT`, since
+    /// `CreateProcessW` appends only `.exe` and a name such as `npm` is
+    /// commonly a `.cmd`.
     internal func possibleExecutablePaths(
         withPathValue pathValue: String?
-    ) -> _OrderedSet<String> {
-        func insertExecutableAddingExtension(
-            _ name: String,
-            currentPath: String,
-            pathExtensions: _OrderedSet<String>,
-            storage: inout _OrderedSet<String>
-        ) {
-            let fullPath = FilePath(currentPath).appending(name)
-            if !name.hasExtension() {
-                for ext in pathExtensions {
-                    var path = fullPath
-                    path.extension = ext
-                    storage.insert(path.string)
-                }
-            } else {
-                storage.insert(fullPath.string)
-            }
-        }
-
+    ) throws(SubprocessError) -> _OrderedSet<String> {
         switch self.storage {
         case .executable(let name):
+            try Self.validate(name: name)
             var possiblePaths: _OrderedSet<String> = .init()
-            let currentEnvironmentValues = Environment.currentEnvironmentValues()
-            // If `name` does not include extensions, we need to try these extensions
-            var pathExtensions: _OrderedSet<String> = _OrderedSet(["com", "exe", "bat", "cmd"])
-            if let extensionList = currentEnvironmentValues["PATHEXT"] {
-                for var ext in extensionList.split(separator: ";") {
-                    ext.removeFirst(1)
-                    pathExtensions.insert(String(ext).lowercased())
-                }
-            }
-            // 1. The directory from which the application loaded.
-            let applicationDirectory = try? fillNullTerminatedWideStringBuffer(
-                initialSize: DWORD(MAX_PATH), maxSize: DWORD(Int16.max)
-            ) {
-                return GetModuleFileNameW(nil, $0.baseAddress, DWORD($0.count))
-            }
-            if let applicationDirectory {
-                insertExecutableAddingExtension(
-                    name,
-                    currentPath: FilePath(applicationDirectory).removingLastComponent().string,
-                    pathExtensions: pathExtensions,
-                    storage: &possiblePaths
-                )
-            }
-            // 2. Current directory
-            let directorySize = GetCurrentDirectoryW(0, nil)
-            let currentDirectory = try? fillNullTerminatedWideStringBuffer(
-                initialSize: directorySize,
-                maxSize: DWORD(Int16.max)
-            ) {
-                return GetCurrentDirectoryW(DWORD($0.count), $0.baseAddress)
-            }
-            if let currentDirectory {
-                insertExecutableAddingExtension(
-                    name,
-                    currentPath: currentDirectory,
-                    pathExtensions: pathExtensions,
-                    storage: &possiblePaths
-                )
-            }
-            // 3. System directory (System32)
-            let systemDirectorySize = GetSystemDirectoryW(nil, 0)
-            let systemDirectory = try? fillNullTerminatedWideStringBuffer(
-                initialSize: systemDirectorySize,
-                maxSize: DWORD(Int16.max)
-            ) {
-                return GetSystemDirectoryW($0.baseAddress, DWORD($0.count))
-            }
-            if let systemDirectory {
-                insertExecutableAddingExtension(
-                    name,
-                    currentPath: systemDirectory,
-                    pathExtensions: pathExtensions,
-                    storage: &possiblePaths
-                )
-            }
-            // 4. The Windows directory
-            let windowsDirectorySize = GetWindowsDirectoryW(nil, 0)
-            let windowsDirectory = try? fillNullTerminatedWideStringBuffer(
-                initialSize: windowsDirectorySize,
-                maxSize: DWORD(Int16.max)
-            ) {
-                return GetWindowsDirectoryW($0.baseAddress, DWORD($0.count))
-            }
-            if let windowsDirectory {
-                insertExecutableAddingExtension(
-                    name,
-                    currentPath: windowsDirectory,
-                    pathExtensions: pathExtensions,
-                    storage: &possiblePaths
-                )
-
-                // 5. 16 bit Systen Directory
-                // Windows documentation stats that "No such standard function
-                // (similar to GetSystemDirectory) exists for the 16-bit system folder".
-                // Use "\(windowsDirectory)\System" instead
-                let systemDirectory16 = FilePath(windowsDirectory).appending("System")
-                insertExecutableAddingExtension(
-                    name,
-                    currentPath: systemDirectory16.string,
-                    pathExtensions: pathExtensions,
-                    storage: &possiblePaths
-                )
-            }
-            // 6. The directories that are listed in the PATH environment variable
-            if let pathValue {
-                let searchPaths = pathValue.split(separator: ";").map { String($0) }
-                for possiblePath in searchPaths {
-                    insertExecutableAddingExtension(
-                        name,
-                        currentPath: possiblePath,
-                        pathExtensions: pathExtensions,
-                        storage: &possiblePaths
-                    )
+            let fileNames = Self.candidateFileNames(for: name)
+            for directory in Self.searchPaths(withPathValue: pathValue) {
+                let directoryPath = FilePath(directory)
+                for fileName in fileNames {
+                    possiblePaths.insert(directoryPath.appending(fileName).string)
                 }
             }
             return possiblePaths
@@ -920,16 +844,45 @@ extension Executable {
             return _OrderedSet([path.string])
         }
     }
+
+    /// The file names to look for, in order, for the executable named `name`.
+    ///
+    /// A name that already carries an extension is tried as written first,
+    /// matching `CreateProcessW`, which appends `.exe` only to a name that has
+    /// no extension at all. Every `PATHEXT` extension is then *appended*, never
+    /// substituted, so a dotted name still resolves: `python3.11` looks for
+    /// `python3.11` and then `python3.11.exe`, not `python3.exe`. A name that
+    /// resolves to a `.bat` or `.cmd` runs through the hardened `cmd.exe`
+    /// invocation in `generateWindowsCommandAndArguments(withPossibleExecutablePath:)`.
+    private static func candidateFileNames(for name: String) -> [String] {
+        // If `name` does not include extensions, we need to try these extensions
+        var pathExtensions: _OrderedSet<String> = _OrderedSet(["com", "exe", "bat", "cmd"])
+        if let extensionList = Environment.currentEnvironmentValues()["PATHEXT"] {
+            for var ext in extensionList.split(separator: ";") {
+                ext.removeFirst(1)
+                pathExtensions.insert(String(ext).lowercased())
+            }
+        }
+        var fileNames: [String] = FilePath(name).extension == nil ? [] : [name]
+        fileNames.append(contentsOf: pathExtensions.map { "\(name).\($0)" })
+        return fileNames
+    }
 }
 
 // MARK: - Environment Resolution
 extension Environment {
+    /// The `PATH` value to resolve ``Executable/name(_:)`` against.
+    ///
+    /// The value the subprocess receives wins, so a name resolves in the
+    /// environment it will run in. When that environment carries no `PATH`,
+    /// this process's own value is used.`nil` means neither defines one.
     internal func pathValue() -> String? {
         switch self.config {
         case .inherit(let overrides):
-            // If PATH value exists in overrides, use it
-            if let value = overrides[.path] {
-                return value
+            // If PATH value exists in overrides, use it. An override maps to
+            // `nil` to unset the value, which falls through to this process.
+            if let overridden = overrides[.path], let overridden {
+                return overridden
             }
             // Fall back to current process
             return Self.currentEnvironmentValues()[.path]
@@ -937,7 +890,7 @@ extension Environment {
             if let value = fullEnvironment[.path] {
                 return value
             }
-            return nil
+            return Self.currentEnvironmentValues()[.path]
         }
     }
 
@@ -958,6 +911,51 @@ extension Environment {
         defer { values.forEach { free($0) } }
         return body(values)
     }
+
+    /// Windows documentation states the following restrictions on environments:
+    /// 1. The name of an environment variable cannot include an equal sign (=).
+    /// 2. The maximum size of a user-defined environment variable is 32,767 characters.
+    /// See https://learn.microsoft.com/en-us/windows/win32/procthread/environment-variables
+    internal func validate() throws(SubprocessError) {
+        let equals = UInt8(ascii: "=")
+        let nul = UInt8(ascii: "\0")
+
+        func _validateError(_ reason: String) -> SubprocessError {
+            return .spawnFailed(withUnderlyingError: nil, reason: reason)
+        }
+
+        func _validate(_ dict: [Key: String?]) throws(SubprocessError) {
+            for (key, value) in dict {
+                // Rule 1: key shall not contain =
+                if key.rawValue.utf8.contains(equals) {
+                    throw _validateError("Environment key '\(key)' must not contain '='.")
+                }
+                // Key and value shall not contain null bytes, otherwise the
+                // null-separated environment block would be silently truncated.
+                if key.rawValue.utf8.contains(nul) {
+                    throw _validateError("Environment key '\(key)' must not contain null bytes.")
+                }
+                if let value, value.utf8.contains(nul) {
+                    throw _validateError("Environment value '\(value)' must not contain null bytes.")
+                }
+
+                // Rule 2: the serialized "key=value" entry must not exceed
+                // 32,767 UTF-16 code units, accounting for the '=' separator
+                // and the null terminator.
+                let entryLength = key.rawValue.utf16.count + 1 + (value?.utf16.count ?? 0) + 1
+                if entryLength > 32767 {
+                    throw _validateError("Environment key and value pair must not exceed 32,767 characters.")
+                }
+            }
+        }
+
+        switch self.config {
+        case .inherit(let updates):
+            try _validate(updates)
+        case .custom(let custom):
+            try _validate(custom)
+        }
+    }
 }
 
 // MARK: - ProcessIdentifier
@@ -970,19 +968,30 @@ public struct ProcessIdentifier: Sendable, Hashable {
     public nonisolated(unsafe) let processDescriptor: HANDLE
     /// The main thread handle for this execution.
     public nonisolated(unsafe) let threadHandle: HANDLE
+    /// The Job Object handle that contains this process and everything it launches.
+    internal nonisolated(unsafe) let jobHandle: HANDLE
 
-    internal init(value: DWORD, processDescriptor: HANDLE, threadHandle: HANDLE) {
+    internal init(
+        value: DWORD,
+        processDescriptor: HANDLE,
+        threadHandle: HANDLE,
+        jobHandle: HANDLE
+    ) {
         self.value = value
         self.processDescriptor = processDescriptor
         self.threadHandle = threadHandle
+        self.jobHandle = jobHandle
     }
 
     internal func close() {
         guard CloseHandle(self.threadHandle) else {
-            fatalError("Failed to close thread HANDLE: \(SubprocessError.WindowsError(rawValue: GetLastError()))")
+            fatalError("Failed to close thread HANDLE: \(SubprocessError.WindowsError(win32Error: GetLastError()))")
         }
         guard CloseHandle(self.processDescriptor) else {
-            fatalError("Failed to close process HANDLE: \(SubprocessError.WindowsError(rawValue: GetLastError()))")
+            fatalError("Failed to close process HANDLE: \(SubprocessError.WindowsError(win32Error: GetLastError()))")
+        }
+        guard CloseHandle(self.jobHandle) else {
+            fatalError("Failed to close job HANDLE: \(SubprocessError.WindowsError(win32Error: GetLastError()))")
         }
     }
 }
@@ -1018,7 +1027,7 @@ extension Configuration {
             env = Environment.currentEnvironmentValues()
             for (key, value) in updateValues {
                 if let value {
-                    // Update env with ew value
+                    // Update env with new value
                     env.updateValue(value, forKey: key)
                 } else {
                     // If `value` is `nil`, unset this value from env
@@ -1035,11 +1044,16 @@ extension Configuration {
         }
         // The environment string must be terminated by a double
         // null-terminator.  Otherwise, CreateProcess will fail with
-        // INVALID_PARMETER.
+        // INVALID_PARMETER. It must also be sorted alphabetically according to
+        // CreateProcessW's documentation:
+        // > To do so, the application must explicitly create these environment variable
+        // > strings, sort them alphabetically (because the system uses a sorted environment),
+        // > and put them into the environment block.
         let environmentString =
-            env.map {
-                $0.key.rawValue + "=" + $0.value
-            }.joined(separator: "\0") + "\0\0"
+            env
+            .sorted { $0.key < $1.key }
+            .map { $0.key.rawValue + "=" + $0.value }
+            .joined(separator: "\0") + "\0\0"
 
         // Prepare arguments
         let (
@@ -1048,10 +1062,11 @@ extension Configuration {
         ) = try self.generateWindowsCommandAndArguments(
             withPossibleExecutablePath: executablePath
         )
-        // Omit applicationName (and therefore rely on commandAndArgs
-        // for executable path) if we don't need to override arg0
+        // `generateWindowsCommandAndArguments` already decided whether to
+        // omit `applicationName` (and rely on `commandAndArgs` for the
+        // executable path), so pass its result through unchanged.
         return (
-            applicationName: self.arguments.executablePathOverride == nil ? nil : applicationName,
+            applicationName: applicationName,
             commandAndArgs: commandAndArgs,
             environment: environmentString,
             intendedWorkingDir: self.workingDirectory?.string
@@ -1160,7 +1175,7 @@ extension Configuration {
         let attributeList = LPPROC_THREAD_ATTRIBUTE_LIST(attributeListPtr.baseAddress!)
         guard InitializeProcThreadAttributeList(attributeList, 1, 0, &attributeListByteCount) else {
             throw SubprocessError.spawnFailed(
-                withUnderlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                withUnderlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
             )
         }
         defer {
@@ -1196,6 +1211,79 @@ extension Configuration {
         return try await body(&info)
     }
 
+    /// Creates a Job Object that will contain a launched subprocess and
+    /// everything it launches.
+    ///
+    /// - Important: The handle is created with default security attributes,
+    /// which makes it non-inheritable. Launched processes must not receive a duplicate
+    /// of the handle, so the calling process can retain exclusive control over the job's
+    /// lifetime.
+    private static func createJobObject() throws(SubprocessError) -> HANDLE {
+        guard let jobHandle = CreateJobObjectW(nil, nil),
+            jobHandle != INVALID_HANDLE_VALUE
+        else {
+            throw SubprocessError.spawnFailed(
+                withUnderlyingError: SubprocessError.WindowsError(win32Error: GetLastError()),
+                reason: "Failed to create Job Object"
+            )
+        }
+        return jobHandle
+    }
+
+    /// Assigns the subprocess to the Job Object and, if requested, resumes
+    /// the subprocess thread.
+    ///
+    /// When `resumeThread` is `false`, the caller is responsible for resuming
+    /// the subprocess using `ResumeThread` on the thread handle exposed through
+    /// `Execution.processIdentifier.threadHandle`. The subprocess remains
+    /// suspended until then.
+    private static func assignChildToJobObjectAndResume(
+        jobHandle: HANDLE,
+        processInfo: PROCESS_INFORMATION,
+        resumeThread: Bool
+    ) throws(SubprocessError) {
+        // `CreateProcessW` succeeded. The child is suspended. Assign it to
+        // the Job Object before resuming, so it cannot run any user code
+        // outside the job.
+        guard AssignProcessToJobObject(jobHandle, processInfo.hProcess) else {
+            let assignError = SubprocessError.WindowsError(win32Error: GetLastError())
+            _ = TerminateProcess(processInfo.hProcess, 1)
+            _ = CloseHandle(processInfo.hThread)
+            _ = CloseHandle(processInfo.hProcess)
+
+            // Detect the most common cause of assignment failure: the parent
+            // process itself is in a non-nestable Job Object.
+            var isParentInJob: WindowsBool = false
+            var reason: String = "Failed to assign child process to Job Object"
+            if IsProcessInJob(GetCurrentProcess(), nil, &isParentInJob),
+                isParentInJob.boolValue
+            {
+                reason += " (likely because the parent process is in a Job Object that does not allow nesting)"
+            }
+
+            throw SubprocessError.spawnFailed(
+                withUnderlyingError: assignError,
+                reason: reason
+            )
+        }
+
+        guard resumeThread else {
+            // The user opted into managing the resume themselves.
+            return
+        }
+
+        guard ResumeThread(processInfo.hThread) != DWORD(bitPattern: -1) else {
+            let resumeError = SubprocessError.WindowsError(win32Error: GetLastError())
+            _ = TerminateProcess(processInfo.hProcess, 1)
+            _ = CloseHandle(processInfo.hThread)
+            _ = CloseHandle(processInfo.hProcess)
+            throw SubprocessError.spawnFailed(
+                withUnderlyingError: resumeError,
+                reason: "Failed to resume child process thread after Job Object assignment"
+            )
+        }
+    }
+
     private func generateWindowsCommandAndArguments(
         withPossibleExecutablePath executablePath: String
     ) throws(SubprocessError) -> (
@@ -1214,7 +1302,7 @@ extension Configuration {
         // For Unix-style argv[0] override (where argv[0] differs from actual exe):
         // Set lpApplicationName = "C:\\path\\to\\real.exe"
         // Set lpCommandLine = "fake_name.exe arg1 arg2"
-        var args = self.arguments.storage.map {
+        let args = self.arguments.storage.map {
             guard case .string(let stringValue) = $0 else {
                 // We should never get here since the API
                 // is guarded off
@@ -1223,83 +1311,259 @@ extension Configuration {
             return stringValue
         }
 
+        // When the target is a batch file (`.bat`/`.cmd`), `CreateProcessW`
+        // runs it by implicitly spawning `cmd.exe /c <command line>`. Because
+        // `cmd.exe` parses its command line differently from
+        // `CommandLineToArgvW`, the step 1 quoting in `quoteWindowsCommandLine`
+        // is not sufficient on its own. A metacharacter such as `&` in an
+        // argument would be interpreted by `cmd.exe` as a command separator,
+        // enabling command injection. This is the "BatBadBut" class of
+        // vulnerabilities (e.g. CVE-2024-24576, CVE-2024-43402). Invoke
+        // `cmd.exe` explicitly with controlled flags and additionally escape
+        // each argument for `cmd.exe` (Colascione's "step 2").
+        let targetsBatchFile = executablePath.isWindowsBatchFile
+
+        if targetsBatchFile {
+            // The argv[0] override is not applicable to a batch file: `cmd.exe`
+            // sets %0 to the script path, so it is intentionally not applied.
+            //
+            // Resolve `cmd.exe` from the system directory so a directory earlier
+            // on PATH can't substitute a different interpreter.
+            let commandPrompt = try Self.resolveCommandPromptPath()
+            let commandAndArgs = try Self.makeBatchFileCommandLine(
+                scriptPath: executablePath,
+                arguments: args
+            )
+            return (applicationName: commandPrompt, commandAndArgs: commandAndArgs)
+        }
+
+        var commandLineArguments = args
         if case .string(let overrideName) = self.arguments.executablePathOverride {
             // Use the override as argument0 and set applicationName
-            args.insert(overrideName, at: 0)
+            commandLineArguments.insert(overrideName, at: 0)
         } else {
             // Set argument[0] to be executableNameOrPath
-            args.insert(executablePath, at: 0)
+            commandLineArguments.insert(executablePath, at: 0)
         }
         return (
-            applicationName: executablePath,
-            commandAndArgs: self.quoteWindowsCommandLine(args)
+            // Omit applicationName (and therefore rely on commandAndArgs for
+            // executable path) when we don't need to override arg0.
+            applicationName: self.arguments.executablePathOverride == nil ? nil : executablePath,
+            commandAndArgs: Self.quoteWindowsCommandLine(commandLineArguments)
         )
     }
 
-    // Taken from SCF
-    private func quoteWindowsCommandLine(_ commandLine: [String]) -> String {
-        func quoteWindowsCommandArg(arg: String) -> String {
-            // Windows escaping, adapted from Daniel Colascione's "Everyone quotes
-            // command line arguments the wrong way" - Microsoft Developer Blog
-            if !arg.contains(where: { " \t\n\"".contains($0) }) {
-                return arg
+    /// Resolves the absolute path to `cmd.exe` from the Windows system directory.
+    private static func resolveCommandPromptPath() throws(SubprocessError) -> String {
+        do throws(SubprocessError.WindowsError) {
+            let systemDirectorySize = GetSystemDirectoryW(nil, 0)
+            let systemDirectory = try fillNullTerminatedWideStringBuffer(
+                initialSize: systemDirectorySize,
+                maxSize: DWORD(Int16.max)
+            ) {
+                return GetSystemDirectoryW($0.baseAddress, DWORD($0.count))
             }
-
-            // To escape the command line, we surround the argument with quotes. However
-            // the complication comes due to how the Windows command line parser treats
-            // backslashes (\) and quotes (")
-            //
-            // - \ is normally treated as a literal backslash
-            //     - e.g. foo\bar\baz => foo\bar\baz
-            // - However, the sequence \" is treated as a literal "
-            //     - e.g. foo\"bar => foo"bar
-            //
-            // But then what if we are given a path that ends with a \? Surrounding
-            // foo\bar\ with " would be "foo\bar\" which would be an unterminated string
-
-            // since it ends on a literal quote. To allow this case the parser treats:
-            //
-            // - \\" as \ followed by the " metachar
-            // - \\\" as \ followed by a literal "
-            // - In general:
-            //     - 2n \ followed by " => n \ followed by the " metachar
-            //     - 2n+1 \ followed by " => n \ followed by a literal "
-            var quoted = "\""
-            var unquoted = arg.unicodeScalars
-
-            while !unquoted.isEmpty {
-                guard let firstNonBackslash = unquoted.firstIndex(where: { $0 != "\\" }) else {
-                    // String ends with a backslash e.g. foo\bar\, escape all the backslashes
-                    // then add the metachar " below
-                    let backslashCount = unquoted.count
-                    quoted.append(String(repeating: "\\", count: backslashCount * 2))
-                    break
-                }
-                let backslashCount = unquoted.distance(from: unquoted.startIndex, to: firstNonBackslash)
-                if unquoted[firstNonBackslash] == "\"" {
-                    // This is  a string of \ followed by a " e.g. foo\"bar. Escape the
-                    // backslashes and the quote
-                    quoted.append(String(repeating: "\\", count: backslashCount * 2 + 1))
-                    quoted.append(String(unquoted[firstNonBackslash]))
-                } else {
-                    // These are just literal backslashes
-                    quoted.append(String(repeating: "\\", count: backslashCount))
-                    quoted.append(String(unquoted[firstNonBackslash]))
-                }
-                // Drop the backslashes and the following character
-                unquoted.removeFirst(backslashCount + 1)
-            }
-            quoted.append("\"")
-            return quoted
+            return FilePath(systemDirectory).appending("cmd.exe").string
+        } catch {
+            throw SubprocessError.asyncIOFailed(
+                reason: "Failed to resolve system directory",
+                underlyingError: error
+            )
         }
-        return commandLine.map(quoteWindowsCommandArg).joined(separator: " ")
     }
 
-    private static func pathAccessible(_ path: String) -> Bool {
+    /// Builds a `cmd.exe` command line that runs a batch file with arguments
+    /// escaped to survive both `cmd.exe` and `CommandLineToArgvW` parsing.
+    ///
+    /// This logic was taken from the Rust standard library's `make_bat_command_line`, which was hardened after
+    /// CVE-2024-24576 / CVE-2024-43402.
+    /// https://github.com/rust-lang/rust/blob/master/library/std/src/sys/args/windows.rs
+    ///
+    /// `/d` skips AutoRun, `/e:ON` keeps command extensions, `/v:OFF` disables
+    /// delayed `!` expansion.
+    internal static func makeBatchFileCommandLine(
+        scriptPath: String,
+        arguments: [String]
+    ) throws(SubprocessError) -> String {
+        // `cmd.exe` identifies the script by its quoted token, so the path must
+        // not contain a quote or end with a backslash (which would escape the
+        // closing quote).
+        guard !scriptPath.contains("\""), scriptPath.last != "\\" else {
+            throw SubprocessError.spawnFailed(
+                withUnderlyingError: nil,
+                reason:
+                    "Cannot safely run batch file \"\(scriptPath)\": its path must not contain '\"' or end with '\\'."
+            )
+        }
+        guard !scriptPath.containsCommandLineControlCharacters() else {
+            throw SubprocessError.spawnFailed(
+                withUnderlyingError: nil,
+                reason:
+                    "Cannot safely run batch file \"\(scriptPath)\": its path must not contain \r \n or null byte."
+            )
+        }
+        var commandLine = "cmd.exe /d /e:ON /v:OFF /c \""
+        commandLine += "\"\(scriptPath)\""
+        for argument in arguments {
+            commandLine += " "
+            commandLine += try Self.escapeBatchFileArgument(argument)
+        }
+        commandLine += "\""
+        return commandLine
+    }
+
+    /// Escapes a single argument destined for a batch file run through
+    /// `cmd.exe`.
+    ///
+    /// Applies the `CommandLineToArgvW` quoting ("step 1"), then
+    /// prefixes every `cmd.exe` metacharacter, including the quotes step 1
+    /// added, with `^` ("step 2"). After `cmd.exe` consumes the carets, the
+    /// launched program decodes exactly the original argument.
+    ///
+    /// Both steps are from Daniel Colascione's "Everyone quotes command line
+    /// arguments the wrong way":
+    /// https://learn.microsoft.com/en-us/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
+    internal static func escapeBatchFileArgument(_ argument: String) throws(SubprocessError) -> String {
+        // A NUL truncates the command-line string and CR/LF can split it
+        // into multiple commands. None can be safely escaped for `cmd.exe`,
+        // so reject them rather than silently truncate (matching the
+        // fail-closed behavior other runtimes adopted).
+        guard !argument.containsCommandLineControlCharacters() else {
+            throw SubprocessError.spawnFailed(
+                withUnderlyingError: nil,
+                reason:
+                    "Cannot pass argument to batch file: arguments may not contain NUL, carriage return, or newline characters."
+            )
+        }
+        // Step 1: quote for `CommandLineToArgvW`. An empty argument must be
+        // force-quoted, otherwise it would vanish from the command line.
+        let quoted = argument.isEmpty ? "\"\"" : Self.quoteWindowsCommandArgument(argument)
+        // Step 2: escape `cmd.exe` metacharacters with `^`.
+        var escaped = ""
+        escaped.reserveCapacity(quoted.count)
+        for character in quoted {
+            if Self.cmdMetacharacters.contains(character) {
+                escaped.append("^")
+            }
+            escaped.append(character)
+        }
+        return escaped
+    }
+
+    /// The characters that trigger `cmd.exe`'s textual transformations and so
+    /// must be escaped with `^` when they appear in an argument.
+    ///
+    /// `%` is included per the reference algorithm, but note `cmd.exe`'s
+    /// environment-variable expansion has edge cases `^` cannot fully suppress;
+    /// `%` is not a command-injection vector, however. `!` is additionally
+    /// neutralized by the `/v:OFF` flag set in `makeBatchFileCommandLine`.
+    private static let cmdMetacharacters: Set<Character> = [
+        "(", ")", "%", "!", "^", "\"", "<", ">", "&", "|",
+    ]
+
+    // Taken from SCF
+    private static func quoteWindowsCommandLine(_ commandLine: [String]) -> String {
+        return commandLine.map(Self.quoteWindowsCommandArgument).joined(separator: " ")
+    }
+
+    /// Quotes a single argument so the `CommandLineToArgvW` / C runtime parser
+    /// in the launched program decodes it back to the original string (Colascione's
+    /// "step 1").
+    ///
+    /// Taken from SCF.
+    /// See https://learn.microsoft.com/en-us/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
+    private static func quoteWindowsCommandArgument(_ arg: String) -> String {
+        // Windows escaping, adapted from Daniel Colascione's "Everyone quotes
+        // command line arguments the wrong way" - Microsoft Developer Blog
+        if !arg.contains(where: { " \t\n\"".contains($0) }) {
+            return arg
+        }
+
+        // To escape the command line, we surround the argument with quotes. However
+        // the complication comes due to how the Windows command line parser treats
+        // backslashes (\) and quotes (")
+        //
+        // - \ is normally treated as a literal backslash
+        //     - e.g. foo\bar\baz => foo\bar\baz
+        // - However, the sequence \" is treated as a literal "
+        //     - e.g. foo\"bar => foo"bar
+        //
+        // But then what if we are given a path that ends with a \? Surrounding
+        // foo\bar\ with " would be "foo\bar\" which would be an unterminated string
+
+        // since it ends on a literal quote. To allow this case the parser treats:
+        //
+        // - \\" as \ followed by the " metachar
+        // - \\\" as \ followed by a literal "
+        // - In general:
+        //     - 2n \ followed by " => n \ followed by the " metachar
+        //     - 2n+1 \ followed by " => n \ followed by a literal "
+        var quoted = "\""
+        var unquoted = arg.unicodeScalars
+
+        while !unquoted.isEmpty {
+            guard let firstNonBackslash = unquoted.firstIndex(where: { $0 != "\\" }) else {
+                // String ends with a backslash e.g. foo\bar\, escape all the backslashes
+                // then add the metachar " below
+                let backslashCount = unquoted.count
+                quoted.append(String(repeating: "\\", count: backslashCount * 2))
+                break
+            }
+            let backslashCount = unquoted.distance(from: unquoted.startIndex, to: firstNonBackslash)
+            if unquoted[firstNonBackslash] == "\"" {
+                // This is  a string of \ followed by a " e.g. foo\"bar. Escape the
+                // backslashes and the quote
+                quoted.append(String(repeating: "\\", count: backslashCount * 2 + 1))
+                quoted.append(String(unquoted[firstNonBackslash]))
+            } else {
+                // These are just literal backslashes
+                quoted.append(String(repeating: "\\", count: backslashCount))
+                quoted.append(String(unquoted[firstNonBackslash]))
+            }
+            // Drop the backslashes and the following character
+            unquoted.removeFirst(backslashCount + 1)
+        }
+        quoted.append("\"")
+        return quoted
+    }
+
+    /// Returns whether `path` names something this process can execute: it must
+    /// exist, and it must not be a directory.
+    ///
+    /// Existence alone is not enough. The candidate paths that
+    /// `possibleExecutablePaths(withPathValue:)` produces otherwise accept a
+    /// directory whose name matches the executable, and a directory can never
+    /// be run.
+    internal static func executableAccessible(_ path: String) -> Bool {
         return path.withCString(encodedAs: UTF16.self) {
             let attrs = GetFileAttributesW($0)
             return attrs != INVALID_FILE_ATTRIBUTES
+                && (attrs & DWORD(FILE_ATTRIBUTE_DIRECTORY)) == 0
         }
+    }
+
+    /// Returns whether `path` exists and is a directory.
+    internal static func isDirectory(_ path: String) -> Bool {
+        return path.withCString(encodedAs: UTF16.self) {
+            let attrs = GetFileAttributesW($0)
+            return attrs != INVALID_FILE_ATTRIBUTES
+                && (attrs & DWORD(FILE_ATTRIBUTE_DIRECTORY)) != 0
+        }
+    }
+}
+
+private extension String {
+    // A NUL truncates the command-line string and CR/LF can split it
+    // into multiple commands. None can be safely escaped for `cmd.exe`,
+    // so reject them rather than silently truncate (matching the
+    // fail-closed behavior other runtimes adopted).
+    func containsCommandLineControlCharacters() -> Bool {
+        for scalar in self.unicodeScalars {
+            if scalar == "\u{0}" || scalar == "\r" || scalar == "\n" {
+                return true
+            }
+        }
+        return false
     }
 }
 
@@ -1315,36 +1579,21 @@ extension FileDescriptor {
         readEnd: FileDescriptor,
         writeEnd: FileDescriptor
     ) {
-        var saAttributes: SECURITY_ATTRIBUTES = SECURITY_ATTRIBUTES()
-        saAttributes.nLength = DWORD(MemoryLayout<SECURITY_ATTRIBUTES>.size)
-        saAttributes.bInheritHandle = true
-        saAttributes.lpSecurityDescriptor = nil
-
-        var readHandle: HANDLE? = nil
-        var writeHandle: HANDLE? = nil
-        guard CreatePipe(&readHandle, &writeHandle, &saAttributes, 0),
-            readHandle != INVALID_HANDLE_VALUE,
-            writeHandle != INVALID_HANDLE_VALUE,
-            let readHandle: HANDLE = readHandle,
-            let writeHandle: HANDLE = writeHandle
-        else {
-            throw SubprocessError.asyncIOFailed(
-                reason: "Filed to create pipe",
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
-            )
+        var fds: [2 of CInt] = [-1, -1]
+        var span = fds.mutableSpan
+        try span.withUnsafeMutableBufferPointer { fds throws(SubprocessError) in
+            guard 0 == _pipe(fds.baseAddress!, 0, _O_BINARY) else {
+                throw SubprocessError.asyncIOFailed(
+                    reason: "Failed to create pipe",
+                    underlyingError: SubprocessError.WindowsError(
+                        cRuntimeError: _subprocess_windows_get_errno()
+                    )
+                )
+            }
         }
-        let readFd = _open_osfhandle(
-            intptr_t(bitPattern: readHandle),
-            FileDescriptor.AccessMode.readOnly.rawValue
-        )
-        let writeFd = _open_osfhandle(
-            intptr_t(bitPattern: writeHandle),
-            FileDescriptor.AccessMode.writeOnly.rawValue
-        )
-
         return (
-            readEnd: FileDescriptor(rawValue: readFd),
-            writeEnd: FileDescriptor(rawValue: writeFd)
+            readEnd: FileDescriptor(rawValue: fds[0]),
+            writeEnd: FileDescriptor(rawValue: fds[1])
         )
     }
 
@@ -1379,10 +1628,10 @@ extension Optional where Wrapped == String {
 }
 
 extension String {
-    /// Invokes `body` with a resolved and potentially `\\?\`-prefixed version of the pointee,
+    /// Invokes `body` with a resolved and potentially `\\?\`-prefixed version of the path,
     /// to ensure long paths greater than MAX_PATH (260) characters are handled correctly.
     ///
-    /// - parameter relative: Returns the original path without transforming through GetFullPathNameW + PathCchCanonicalizeEx, if the path is relative.
+    /// - parameter relative: If `true`, returns the original path without transforming through GetFullPathNameW + PathCchCanonicalizeEx, if the path is relative.
     /// - seealso: https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation
     internal func withNTPathRepresentation<Result: Sendable>(
         _ body: (UnsafePointer<WCHAR>) throws(SubprocessError) -> Result
@@ -1416,7 +1665,7 @@ extension String {
                 return try withUnsafeTemporaryAllocation(of: WCHAR.self, capacity: Int(dwLength)) { pwszFullPath in
                     guard (1..<dwLength).contains(GetFullPathNameW(pwszPath, DWORD(pwszFullPath.count), pwszFullPath.baseAddress, nil)) else {
                         throw SubprocessError.spawnFailed(
-                            withUnderlyingError: SubprocessError.WindowsError(rawValue: GetLastError()),
+                            withUnderlyingError: SubprocessError.WindowsError(win32Error: GetLastError()),
                             reason: "Invalid Windows Path"
                         )
                     }
@@ -1446,7 +1695,7 @@ extension String {
 
                     throw SubprocessError.spawnFailed(
                         withUnderlyingError: SubprocessError.WindowsError(
-                            rawValue: WIN32_FROM_HRESULT(result)
+                            hresult: result
                         ),
                         reason: "Invalid Windows Path"
                     )
@@ -1455,9 +1704,20 @@ extension String {
         }
     }
 
-    internal func hasExtension() -> Bool {
-        let components = self.split(separator: ".")
-        return components.count > 1 && components.last?.count == 3
+    /// Returns `true` if this path names a Windows batch file (`.bat` or
+    /// `.cmd`), which `CreateProcessW` executes by launching `cmd.exe`.
+    ///
+    /// Trailing spaces and dots are ignored first, because Windows strips them
+    /// when resolving a path: `deploy.bat. .` still runs as a batch file. Not
+    /// accounting for this was the bypass behind CVE-2024-43402:
+    /// https://blog.rust-lang.org/2024/09/04/cve-2024-43402/
+    internal var isWindowsBatchFile: Bool {
+        var end = self[...]
+        while let last = end.last, last == " " || last == "." {
+            end = end.dropLast()
+        }
+        let lowercased = end.lowercased()
+        return lowercased.hasSuffix(".bat") || lowercased.hasSuffix(".cmd")
     }
 }
 
@@ -1498,7 +1758,8 @@ extension UInt8 {
     }
 }
 
-/// Calls a Win32 API function that fills a (potentially long path) null-terminated string buffer by continually attempting to allocate more memory up until the true max path is reached.
+/// Calls a Win32 API function that fills a (potentially long path) null-terminated string buffer by continually attempting to allocate more memory until the true max path is reached.
+///
 /// This is especially useful for protecting against race conditions like with GetCurrentDirectoryW where the measured length may no longer be valid on subsequent calls.
 /// - parameter initialSize: Initial size of the buffer (including the null terminator) to allocate to hold the returned string.
 /// - parameter maxSize: Maximum size of the buffer (including the null terminator) to allocate to hold the returned string.
@@ -1508,35 +1769,45 @@ extension UInt8 {
 internal func fillNullTerminatedWideStringBuffer(
     initialSize: DWORD,
     maxSize: DWORD,
-    _ body: (UnsafeMutableBufferPointer<WCHAR>) throws(SubprocessError.WindowsError) -> DWORD
+    _ body: (UnsafeMutableBufferPointer<WCHAR>) -> DWORD
 ) throws(SubprocessError.WindowsError) -> String {
+    enum FillResult {
+        case filled(String)
+        case insufficient
+        case failed(DWORD)
+    }
     var bufferCount = max(1, min(initialSize, maxSize))
     while bufferCount <= maxSize {
-        do {
-            if let result = try withUnsafeTemporaryAllocation(
-                of: WCHAR.self, capacity: Int(bufferCount),
-                { buffer throws(SubprocessError.WindowsError) in
-                    let count = try body(buffer)
-                    switch count {
-                    case 0:
-                        throw SubprocessError.WindowsError(rawValue: GetLastError())
-                    case 1..<DWORD(buffer.count):
-                        let result = String(decodingCString: buffer.baseAddress!, as: UTF16.self)
-                        assert(result.utf16.count == count, "Parsed UTF-16 count \(result.utf16.count) != reported UTF-16 count \(count)")
-                        return result
-                    default:
-                        bufferCount *= 2
-                        return nil
-                    }
-                })
-            {
-                return result
+        let result: FillResult = withUnsafeTemporaryAllocation(
+            of: WCHAR.self,
+            capacity: Int(bufferCount)
+        ) { buffer in
+            let count = body(buffer)
+            switch count {
+            case 0:
+                return .failed(GetLastError())
+            case 1..<DWORD(buffer.count):
+                // `count` is in-range, so the buffer holds a null-terminated
+                // string of `count` units.
+                return .filled(
+                    String(
+                        decodingCString: buffer.baseAddress!,
+                        as: UTF16.self
+                    ))
+            default:
+                return .insufficient
             }
-        } catch {
-            throw error as! SubprocessError.WindowsError
+        }
+        switch result {
+        case .filled(let string):
+            return string
+        case .failed(let win32Error):
+            throw SubprocessError.WindowsError(win32Error: win32Error)
+        case .insufficient:
+            bufferCount *= 2
         }
     }
-    throw SubprocessError.WindowsError(rawValue: DWORD(ERROR_INSUFFICIENT_BUFFER))
+    throw SubprocessError.WindowsError(win32Error: DWORD(ERROR_INSUFFICIENT_BUFFER))
 }
 
 #endif // canImport(WinSDK)

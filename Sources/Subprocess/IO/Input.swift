@@ -38,7 +38,11 @@ import FoundationEssentials
 /// Conform to this protocol and implement ``write(with:)``
 /// to provide a custom input source.
 public protocol InputProtocol: Sendable, ~Copyable {
-    /// Writes the input to the subprocess asynchronously.
+    /// Writes this input source's bytes to the subprocess's standard input.
+    ///
+    /// - Parameter writer: The writer connected to the subprocess's standard
+    ///   input; use it to send the bytes this input source represents.
+    /// - Throws: An error if writing to the subprocess fails.
     func write(with writer: StandardInputWriter) async throws
 }
 
@@ -60,7 +64,12 @@ public struct NoInput: InputProtocol {
         )
     }
 
-    /// Writes the input to the subprocess asynchronously.
+    /// Writes no input to the subprocess.
+    ///
+    /// This method is a no-op. ``NoInput`` redirects the subprocess's standard
+    /// input to the null device, so there is nothing to write here.
+    ///
+    /// - Parameter writer: Ignored; ``NoInput`` has no data to write.
     public func write(with writer: StandardInputWriter) async throws {
         // Intentional no-op
         // NoInput redirects stdin to /dev/null, so there is no
@@ -73,7 +82,7 @@ public struct NoInput: InputProtocol {
 /// An input type that reads from a specified file descriptor.
 ///
 /// You can choose to have the subprocess automatically close
-/// the file descriptor after it spawns.
+/// the file descriptor after it launches.
 public struct FileDescriptorInput: InputProtocol {
     private let fileDescriptor: FileDescriptor
     private let closeAfterSpawningProcess: Bool
@@ -93,7 +102,14 @@ public struct FileDescriptorInput: InputProtocol {
         )
     }
 
-    /// Writes the input to the subprocess asynchronously.
+    /// Writes no input to the subprocess.
+    ///
+    /// This method is a no-op. ``FileDescriptorInput`` has the subprocess read
+    /// directly from the provided file descriptor, so there is nothing to
+    /// write here.
+    ///
+    /// - Parameter writer: Ignored; ``FileDescriptorInput`` has no data to
+    ///   write.
     public func write(with writer: StandardInputWriter) async throws {
         // Intentional no-op
         // FileDescriptorInput reads from a pre-existing file
@@ -119,7 +135,6 @@ public struct StringInput<
 >: InputProtocol {
     private let string: InputString
 
-    /// Writes the input to the subprocess asynchronously.
     public func write(with writer: StandardInputWriter) async throws {
         guard let array = self.string.byteArray(using: Encoding.self) else {
             return
@@ -132,11 +147,10 @@ public struct StringInput<
     }
 }
 
-/// An input type that reads from a `[UInt8]` array.
+/// An input type that reads from an array of bytes.
 public struct ArrayInput: InputProtocol {
     private let array: [UInt8]
 
-    /// Writes the input to the subprocess asynchronously.
     public func write(with writer: StandardInputWriter) async throws {
         _ = try await writer.write(self.array)
     }
@@ -146,15 +160,24 @@ public struct ArrayInput: InputProtocol {
     }
 }
 
-/// A concrete input type that the run closure uses to write custom input
-/// into the subprocess.
-internal struct CustomWriteInput: InputProtocol {
-    /// Asynchronously write the input to the subprocess using the
-    /// write file descriptor.
+/// An input type that lets the body closure write to the subprocess's
+/// standard input while the process runs.
+///
+/// Create a value of this type with ``InputProtocol/inputWriter``, then pass it
+/// to a `run` function that takes a body closure. Inside the closure, write your
+/// input through ``Execution/standardInputWriter`` and call
+/// ``StandardInputWriter/finish()`` to signal end-of-file.
+public struct CustomWriteInput: InputProtocol {
+    /// Writes no input to the subprocess.
+    ///
+    /// This method is a no-op. ``CustomWriteInput`` exposes
+    /// ``StandardInputWriter`` to the body closure, which performs the writes
+    /// instead.
+    ///
+    /// - Parameter writer: Ignored; ``CustomWriteInput`` performs no write
+    ///   here.
     public func write(with writer: StandardInputWriter) async throws {
-        // Intentional no-op
-        // CustomWriteInput exposes the StandardInputWriter directly
-        // to the caller's closure, so writing is handled there instead.
+        // Intentional no-op.
     }
 
     internal init() {}
@@ -169,7 +192,7 @@ extension InputProtocol where Self == FileDescriptorInput {
     /// Creates a subprocess input from a file descriptor.
     ///
     /// Set `closeAfterSpawningProcess` to `true` to close the file
-    /// descriptor after the subprocess spawns.
+    /// descriptor after the subprocess launches.
     public static func fileDescriptor(
         _ fd: FileDescriptor,
         closeAfterSpawningProcess: Bool
@@ -183,7 +206,7 @@ extension InputProtocol where Self == FileDescriptorInput {
     /// Creates a subprocess input that reads from the current process's standard input.
     ///
     /// The file descriptor isn't closed afterward.
-    public static var standardInput: Self {
+    public static var currentStandardInput: Self {
         return Self.fileDescriptor(
             .standardInput,
             closeAfterSpawningProcess: false
@@ -220,6 +243,16 @@ extension InputProtocol {
     }
 }
 
+extension InputProtocol where Self == CustomWriteInput {
+    /// Creates a subprocess input that the body closure writes to through
+    /// ``Execution/standardInputWriter``.
+    ///
+    /// Use this input with a `run` overload that takes a body closure.
+    public static var inputWriter: Self {
+        return CustomWriteInput()
+    }
+}
+
 extension InputProtocol {
     internal func createPipe() throws(SubprocessError) -> CreatedPipe {
         if let noInput = self as? NoInput {
@@ -235,41 +268,72 @@ extension InputProtocol {
 // MARK: - StandardInputWriter
 
 /// A writer that sends data to the standard input of a subprocess.
+///
+/// You obtain a `StandardInputWriter` from ``Execution/standardInputWriter``
+/// inside the body closure of a `run` function, when the input is
+/// ``InputProtocol/inputWriter``. Each `write` call sends its bytes to the
+/// subprocess right away — there's no intermediate buffer and no separate flush
+/// step. Call ``finish()`` after your final write so the subprocess sees
+/// end-of-file on its standard input.
+///
+/// - Important: The writer is valid only for the duration of the body closure.
+///   When the closure returns, `run` automatically calls ``finish()`` to close
+///   standard input. Don't store the writer or use it after the closure
+///   returns: a write at that point throws a ``SubprocessError`` whose code is
+///   ``SubprocessError/Code/failedToWriteToSubprocess``.
+///
+/// - Important: If you await the subprocess's entire standard output from within
+///   the body closure, call ``finish()`` *before* you await it. Many programs
+///   don't finish producing output until they see end-of-file on standard
+///   input, so waiting for all output without finishing first can deadlock.
 public final actor StandardInputWriter: Sendable {
 
-    internal var diskIO: IOChannel
+    internal var diskIO: IODescriptor
+    internal let processIdentifier: ProcessIdentifier
 
-    init(diskIO: consuming IOChannel) {
+    private var didFinish: Bool = false
+
+    init(diskIO: consuming IODescriptor, processIdentifier: ProcessIdentifier) {
         self.diskIO = diskIO
+        self.processIdentifier = processIdentifier
     }
 
     /// Writes an array of bytes to the subprocess's standard input.
     /// - Parameter array: The bytes to write.
-    /// - Throws: `SubprocessError` with error code `.failedToWriteToSubprocess`.
-    ///     See ``underlyingError`` for more details.
+    /// - Throws: ``SubprocessError`` with error code ``SubprocessError/Code/failedToWriteToSubprocess``.
+    ///     See ``SubprocessError/underlyingError`` for more details. Also throws
+    ///     this error if the writer has already finished (see ``finish()``).
     /// - Returns: The number of bytes written.
     public func write(
         _ array: [UInt8]
     ) async throws(SubprocessError) -> Int {
-        return try await AsyncIO.shared.write(array, to: self.diskIO)
+        guard !self.didFinish else {
+            throw SubprocessError.standardInputWriterFinished
+        }
+        return try await AsyncIO.shared.write(array, to: self.diskIO, for: self.processIdentifier)
     }
 
     /// Writes a raw span to the subprocess's standard input.
     ///
     /// - Parameter span: The span to write.
-    /// - Throws: `SubprocessError` with error code `.failedToWriteToSubprocess`.
-    ///     See ``underlyingError`` for more details.
+    /// - Throws: ``SubprocessError`` with error code ``SubprocessError/Code/failedToWriteToSubprocess``.
+    ///     See ``SubprocessError/underlyingError`` for more details. Also throws
+    ///     this error if the writer has already finished (see ``finish()``).
     /// - Returns: The number of bytes written.
     public func write(_ span: borrowing RawSpan) async throws(SubprocessError) -> Int {
-        return try await AsyncIO.shared.write(span, to: self.diskIO)
+        guard !self.didFinish else {
+            throw SubprocessError.standardInputWriterFinished
+        }
+        return try await AsyncIO.shared.write(span, to: self.diskIO, for: self.processIdentifier)
     }
 
     /// Writes a string to the subprocess's standard input.
     /// - Parameters:
     ///   - string: The string to write.
     ///   - encoding: The encoding to use when converting the string to bytes.
-    /// - Throws: `SubprocessError` with error code `.failedToWriteToSubprocess`.
-    ///     See ``underlyingError`` for more details.
+    /// - Throws: ``SubprocessError`` with error code ``SubprocessError/Code/failedToWriteToSubprocess``.
+    ///     See ``SubprocessError/underlyingError`` for more details. Also throws
+    ///     this error if the writer has already finished (see ``finish()``).
     /// - Returns: The number of bytes written.
     public func write<Encoding: Unicode.Encoding>(
         _ string: some StringProtocol,
@@ -281,10 +345,22 @@ public final actor StandardInputWriter: Sendable {
         return 0
     }
 
-    /// Signals that all writes are finished.
-    /// - Throws: `SubprocessError` with error code `.asyncIOFailed`.
-    ///     See ``underlyingError`` for more details.
+    /// Signals that all writes are finished, closing standard input so the
+    /// subprocess sees end-of-file.
+    ///
+    /// `run` calls this automatically when the body closure returns, so you only
+    /// need to call it yourself when you want the subprocess to observe
+    /// end-of-file earlier. Calling `finish()` more than once is safe; subsequent calls do nothing.
+    /// After finishing, further writes throw a ``SubprocessError`` with the code
+    /// ``SubprocessError/Code/failedToWriteToSubprocess``.
+    ///
+    /// - Throws: ``SubprocessError`` with error code ``SubprocessError/Code/asyncIOFailed``.
+    ///     See ``SubprocessError/underlyingError`` for more details.
     public func finish() async throws(SubprocessError) {
+        guard !self.didFinish else {
+            return
+        }
+        self.didFinish = true
         try self.diskIO.safelyClose()
     }
 }

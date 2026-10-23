@@ -22,7 +22,6 @@ import Musl
 import WinSDK
 #endif
 
-internal import Dispatch
 import _SubprocessCShims
 
 #if canImport(Synchronization)
@@ -92,11 +91,13 @@ private struct BackgroundWorkItem {
 // exposed so we can use it with `pthread_cond_wait`.
 private final class WorkQueue: Sendable {
     private nonisolated(unsafe) var queue: [BackgroundWorkItem]
+    private nonisolated(unsafe) var isShuttingDown: Bool
     internal nonisolated(unsafe) let mutex: UnsafeMutablePointer<MutexType>
     internal nonisolated(unsafe) let waitCondition: UnsafeMutablePointer<ConditionType>
 
     init() {
         self.queue = []
+        self.isShuttingDown = false
         self.mutex = UnsafeMutablePointer<MutexType>.allocate(capacity: 1)
         self.waitCondition = UnsafeMutablePointer<ConditionType>.allocate(capacity: 1)
         #if canImport(WinSDK)
@@ -129,7 +130,11 @@ private final class WorkQueue: Sendable {
             pthread_mutex_unlock(mutex)
         }
         #endif
-        if condition(&queue) {
+        // Use a `while` loop (not `if`) so that spurious wakeups and signal
+        // interruptions of `pthread_cond_wait` do not fall through the wait.
+        // `condition` is responsible for also returning `false` when shutting
+        // down, so the worker can wake and exit rather than sleeping forever.
+        while condition(&queue) {
             #if canImport(WinSDK)
             SleepConditionVariableCS(self.waitCondition, mutex, INFINITE)
             #else
@@ -142,8 +147,9 @@ private final class WorkQueue: Sendable {
     // Only called in worker thread. Sleeps the thread if there's no more item
     func dequeue() -> BackgroundWorkItem? {
         return self.withUnsafeUnderlyingLock { queue in
-            // Sleep the worker thread if there's no more work
-            queue.isEmpty
+            // Sleep the worker thread while there's no work and we're not
+            // shutting down. Returning `false` here ends the wait.
+            queue.isEmpty && !self.isShuttingDown
         } body: { mutex, queue in
             guard !queue.isEmpty else {
                 return nil
@@ -167,6 +173,7 @@ private final class WorkQueue: Sendable {
     func shutdown() {
         self.withLock { queue in
             queue.removeAll()
+            self.isShuttingDown = true
             #if canImport(WinSDK)
             WakeConditionVariable(self.waitCondition)
             #else
@@ -244,13 +251,14 @@ private func _shutdownWorkerThread() {
 
 #if canImport(Darwin)
 // Unfortunately on Darwin we cannot unconditionally use Atomic since it requires macOS 15
-internal struct AtomicCounter: ~Copyable {
+internal final class AtomicCounter: Sendable {
     private let storage: OSAllocatedUnfairLock<UInt8>
 
     internal init() {
         self.storage = .init(initialState: 0)
     }
 
+    @discardableResult
     internal func addOne() -> UInt8 {
         return self.storage.withLock {
             $0 += 1
@@ -259,7 +267,7 @@ internal struct AtomicCounter: ~Copyable {
     }
 }
 #else
-internal struct AtomicCounter: ~Copyable {
+internal final class AtomicCounter: Sendable {
 
     private let storage: Atomic<UInt8>
 
@@ -267,6 +275,7 @@ internal struct AtomicCounter: ~Copyable {
         self.storage = Atomic(0)
     }
 
+    @discardableResult
     internal func addOne() -> UInt8 {
         return self.storage.add(1, ordering: .sequentiallyConsistent).newValue
     }
@@ -306,7 +315,7 @@ internal func begin_thread_x(
     else {
         // _beginthreadex uses errno instead of GetLastError()
         let capturedError = _subprocess_windows_get_errno()
-        throw SubprocessError.WindowsError(rawValue: DWORD(capturedError))
+        throw SubprocessError.WindowsError(cRuntimeError: capturedError)
     }
 
     return threadHandle

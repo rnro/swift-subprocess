@@ -10,11 +10,14 @@ on:
 jobs:
   tests:
     name: Test
-    uses: swiftlang/github-workflows/.github/workflows/swift_package_test.yml@0.0.11
+    uses: rnro/github-workflows/.github/workflows/package_test.yml@unification
     with:
-      linux_os_versions: '["amazonlinux2", "bookworm", "noble", "jammy", "rhel-ubi9"]'
-      linux_swift_versions: '["6.2", "nightly-main"]'
-      linux_pre_build_command: |
+      # A fork's default branch does not carry the change, so the ref is named.
+      # A released version needs neither input.
+      workflows_repository: rnro/github-workflows
+      workflows_ref: unification
+      linux_os: '["bookworm", "noble", "jammy", "rhel-ubi9"]'
+      linux_setup_command: |
         if command -v apt-get >/dev/null 2>&1 ; then # bookworm, noble, jammy
           # Test dependencies
           if command -v sudo &> /dev/null && [ "$EUID" -ne 0 ]; then
@@ -29,43 +32,79 @@ jobs:
 
           # Test dependencies
           dnf install -y procps
-        elif command -v yum >/dev/null 2>&1 ; then # amazonlinux2
-          yum update -y
-
-          # Test dependencies
-          yum install -y procps
         fi
-      linux_build_command: 'swift test && swift test -c release && swift test --disable-default-traits'
-      enable_freebsd_checks: true
-      freebsd_build_command: 'swift test && swift test -c release && swift test --disable-default-traits'
-      windows_swift_versions: '["6.2", "nightly-main"]'
-      windows_build_command: |
+      linux_command: 'swift test && swift test -c release && swift test --disable-default-traits'
+      enable_freebsd: true
+      freebsd_command: 'swift test && swift test -c release && swift test --disable-default-traits'
+      windows_command: |
         Invoke-Program swift test
         Invoke-Program swift test -c release
         Invoke-Program swift test --disable-default-traits
-      enable_macos_checks: true
-      macos_xcode_versions: '["26.0"]'
-      macos_build_command: 'xcrun swift test && xcrun swift test -c release && xcrun swift test --disable-default-traits'
+      enable_macos: true
+      macos_command: 'xcrun swift test && xcrun swift test -c release && xcrun swift test --disable-default-traits'
+      enable_macos_swiftly: true
+      macos_swiftly_command: 'swiftly run swift test && swiftly run swift test -c release && swiftly run swift test --disable-default-traits'
       enable_linux_static_sdk_build: true
       enable_android_sdk_build: true
+      enable_android_emulator_tests: true
+      # The final triple is used for emulator testing and must match the host architecture (x86_64).
+      android_sdk_triples: '["aarch64-unknown-linux-android28", "armv7-unknown-linux-android28", "x86_64-unknown-linux-android28"]'
       android_ndk_versions: '["r27d", "r29"]'
-      linux_static_sdk_versions: '["6.2", "nightly-main"]'
-      linux_static_sdk_build_command: |
+      # The old workflow interpolated this into a `run:` block, so the shell
+      # unescaped `\$triple` once before the SDK script evaluated it. The unified
+      # workflows carry the command through the matrix instead, with no such step,
+      # so the variable is written plainly.
+      linux_static_sdk_command: |
         for triple in aarch64-swift-linux-musl x86_64-swift-linux-musl ; do
-          swift build --swift-sdk "\$triple"
-          swift build --swift-sdk "\$triple" --disable-default-traits
+          swift build --swift-sdk "$triple"
+          swift build --swift-sdk "$triple" --disable-default-traits
         done
-        # empty line to ignore the --swift-sdk given by swiftlang/github-workflows/.github/workflows/scripts/install-and-build-with-sdk.sh \
+
+  # Amazon Linux 2023 images are only published for the nightlies of the versions
+  # tested here, and the unified workflows have no exclude list, so it is its own call.
+  tests_amazonlinux:
+    name: Test Amazon Linux
+    uses: rnro/github-workflows/.github/workflows/package_test.yml@unification
+    with:
+      workflows_repository: rnro/github-workflows
+      workflows_ref: unification
+      name: tests-amazonlinux
+      enable_windows: false
+      linux_os: '["amazonlinux2023"]'
+      linux_swift_versions: '["nightly-main"]'
+      linux_setup_command: |
+        dnf update -y
+
+        # Test dependencies
+        dnf install -y procps
+      linux_command: 'swift test && swift test -c release && swift test --disable-default-traits'
+
+  test_linux_kernel:
+    name: Test Linux Kernel / ${{ matrix.dist-kern }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # These are specific distro and kernel versions that the test qemu script supports from here: https://images.linuxcontainers.org
+        dist-kern: ["ubuntu-kernel-4.18", "ubuntu-kernel-5.14"]
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Run Test
+        run: bash -c './scripts/test-using-qemu.sh ${{ matrix.dist-kern }} -- swift test'
 
   soundness:
     name: Soundness
-    uses: swiftlang/github-workflows/.github/workflows/soundness.yml@0.0.11
+    uses: swiftlang/github-workflows/.github/workflows/soundness.yml@0.0.15
     with:
       license_header_check_project_name: "Swift.org"
       docs_check_enabled: false
       format_check_enabled: true
       unacceptable_language_check_enabled: false
-      api_breakage_check_enabled: false
+      api_breakage_check_enabled: true
 
   cmake_build:
     name: CMake Build
@@ -73,7 +112,7 @@ jobs:
     container: swiftlang/swift:nightly-noble
     steps:
       - name: checkout sources
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Install dependencies
         shell: bash
         run: apt update && apt install -y cmake ninja-build

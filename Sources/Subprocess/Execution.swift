@@ -29,16 +29,84 @@ import Musl
 
 /// A running subprocess.
 ///
-/// Use this type to send signals to the child process
-/// and to stream its output and error.
-public struct Execution: Sendable {
+/// Use this type to send signals to the subprocess, write to its standard
+/// input, and stream its standard output and standard error.
+///
+/// The three generic parameters determine which streaming properties are
+/// available. The ``standardInputWriter`` property is available when `Input`
+/// is ``CustomWriteInput``, the ``standardOutput`` property is available
+/// when `Output` is ``SequenceOutput``, and the ``standardError`` property
+/// is available when `Error` is ``SequenceOutput``.
+///
+/// You receive an `Execution` value from the body closure of a `run`
+/// function. The value is valid only for the duration of the closure.
+/// Don't let the execution value escape the closure.
+public struct Execution<Input: InputProtocol, Output: OutputProtocol, Error: OutputProtocol>: Sendable {
     /// The process identifier of this subprocess.
     public let processIdentifier: ProcessIdentifier
 
+    private let inputWriter: StandardInputWriter?
+    private let outputStream: SubprocessOutputSequence?
+    private let errorStream: SubprocessOutputSequence?
+
     init(
-        processIdentifier: ProcessIdentifier
+        processIdentifier: ProcessIdentifier,
+        inputWriter: StandardInputWriter?,
+        outputStream: SubprocessOutputSequence?,
+        errorStream: SubprocessOutputSequence?
     ) {
         self.processIdentifier = processIdentifier
+        self.inputWriter = inputWriter
+        self.outputStream = outputStream
+        self.errorStream = errorStream
+    }
+}
+
+extension Execution where Input == CustomWriteInput {
+    /// A writer that sends data to the subprocess's standard input.
+    ///
+    /// Call ``StandardInputWriter/finish()`` after the last write so the
+    /// subprocess sees end-of-file on its standard input. If you don't, `run`
+    /// finishes the writer for you when the body closure returns.
+    ///
+    /// Like the ``Execution`` value itself, the writer is valid only for the
+    /// duration of the body closure. Don't store it or use it after the closure
+    /// returns. See ``StandardInputWriter`` for details.
+    public var standardInputWriter: StandardInputWriter {
+        return self.inputWriter!
+    }
+}
+
+extension Execution where Output == SequenceOutput {
+    /// The standard output of the subprocess as an asynchronous sequence of
+    /// buffers.
+    public var standardOutput: SubprocessOutputSequence {
+        return self.outputStream!
+    }
+}
+
+extension Execution where Error == SequenceOutput {
+    /// The standard error of the subprocess as an asynchronous sequence of
+    /// buffers.
+    public var standardError: SubprocessOutputSequence {
+        return self.errorStream!
+    }
+}
+
+extension Execution {
+    @available(*, unavailable, message: "this property requires that the input is .inputWriter")
+    public var standardInputWriter: StandardInputWriter {
+        fatalError()
+    }
+
+    @available(*, unavailable, message: "this property requires that the output is .sequence")
+    public var standardOutput: SubprocessOutputSequence {
+        fatalError()
+    }
+
+    @available(*, unavailable, message: "this property requires that the error is .sequence")
+    public var standardError: SubprocessOutputSequence {
+        fatalError()
     }
 }
 

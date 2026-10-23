@@ -19,8 +19,8 @@ import SystemPackage
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
-#elseif canImport(Bionic)
-import Bionic
+#elseif canImport(Android)
+import Android
 #elseif canImport(Musl)
 import Musl
 #elseif canImport(WinSDK)
@@ -28,7 +28,6 @@ import WinSDK
 #endif
 
 import Testing
-import Dispatch
 import Foundation
 import TestResources
 import _SubprocessCShims
@@ -46,12 +45,12 @@ extension SubprocessAsyncIOTests {
     @Test func testBasicReadWrite() async throws {
         let testData = randomData(count: 1024)
         try await runReadWriteTest { readIO, readTestBed in
-            let readData = try #require(
-                try await readIO.read(from: readTestBed.ioChannel, upTo: .max)
+            let readData = try await readUntilEOF(
+                from: readTestBed.ioDescriptor, with: readIO
             )
             #expect(Array(readData) == testData)
         } writer: { writeIO, writeTestBed in
-            _ = try await writeIO.write(testData, to: writeTestBed.ioChannel)
+            _ = try await writeIO.write(testData, to: writeTestBed.ioDescriptor)
             try await writeTestBed.finish()
         }
     }
@@ -64,24 +63,32 @@ extension SubprocessAsyncIOTests {
         }
         for _ in 0..<10 {
             // Generate some that are longer than buffer size
-            _chunks.append(randomData(count: Int.random(in: Subprocess.readBufferSize..<Subprocess.readBufferSize * 3)))
+            _chunks.append(randomData(count: Int.random(in: Subprocess.systemPageSize..<Subprocess.systemPageSize * 3)))
         }
         _chunks.shuffle()
         let chunks = _chunks
         try await runReadWriteTest { readIO, readTestBed in
+            // `read` returns after each underlying read, so accumulate
+            // until we have the expected chunk's worth of bytes.
             for expectedChunk in chunks {
-                let readData = try #require(
-                    try await readIO.read(from: readTestBed.ioChannel, upTo: expectedChunk.count)
-                )
-                #expect(Array(readData) == expectedChunk)
+                var readData: [UInt8] = []
+                while readData.count < expectedChunk.count {
+                    let chunk = try await read(
+                        until: expectedChunk.count - readData.count,
+                        from: readTestBed.ioDescriptor,
+                        with: readIO
+                    )
+                    readData.append(contentsOf: chunk)
+                }
+                #expect(readData == expectedChunk)
             }
 
             // Final read should return nil
-            let finalRead = try await readIO.read(from: readTestBed.ioChannel, upTo: .max)
+            let finalRead = try await readIO.read(from: readTestBed.ioDescriptor, upTo: 1024)
             #expect(finalRead == nil)
         } writer: { writeIO, writeTestBed in
             for chunk in chunks {
-                _ = try await writeIO.write(chunk, to: writeTestBed.ioChannel)
+                _ = try await writeIO.write(chunk, to: writeTestBed.ioDescriptor)
                 try await writeTestBed.delay(.milliseconds(10))
             }
             try await writeTestBed.finish()
@@ -93,7 +100,7 @@ extension SubprocessAsyncIOTests {
 extension SubprocessAsyncIOTests {
     @Test func testReadFromEmptyPipe() async throws {
         try await runReadWriteTest { readIO, readTestBed in
-            let readData = try await readIO.read(from: readTestBed.ioChannel, upTo: .max)
+            let readData = try await readIO.read(from: readTestBed.ioDescriptor, upTo: 1024)
             #expect(readData == nil)
         } writer: { writeIO, writeTestBed in
             // Close write end immediately without writing any data
@@ -104,20 +111,20 @@ extension SubprocessAsyncIOTests {
     @Test func testZeroLengthRead() async throws {
         let testData = randomData(count: 64)
         try await runReadWriteTest { readIO, readTestBed in
-            let readData = try await readIO.read(from: readTestBed.ioChannel, upTo: 0)
+            let readData = try await readIO.read(from: readTestBed.ioDescriptor, upTo: 0)
             #expect(readData == nil)
         } writer: { writeIO, writeTestBed in
-            _ = try await writeIO.write(testData, to: writeTestBed.ioChannel)
+            _ = try await writeIO.write(testData, to: writeTestBed.ioDescriptor)
             try await writeTestBed.finish()
         }
     }
 
     @Test func testZeroLengthWrite() async throws {
         try await runReadWriteTest { readIO, readTestBed in
-            let readData = try await readIO.read(from: readTestBed.ioChannel, upTo: .max)
+            let readData = try await readIO.read(from: readTestBed.ioDescriptor, upTo: 1024)
             #expect(readData == nil)
         } writer: { writeIO, writeTestBed in
-            let written = try await writeIO.write([], to: writeTestBed.ioChannel)
+            let written = try await writeIO.write([], to: writeTestBed.ioDescriptor)
             #expect(written == 0)
             try await writeTestBed.finish()
         }
@@ -126,12 +133,14 @@ extension SubprocessAsyncIOTests {
     @Test func testLargeReadWrite() async throws {
         let testData = randomData(count: 1024 * 1024)
         try await runReadWriteTest { readIO, readTestBed in
-            let readData = try #require(
-                try await readIO.read(from: readTestBed.ioChannel, upTo: .max)
+            // `read` returns after each underlying read, so accumulate
+            // until EOF.
+            let readData = try await readUntilEOF(
+                from: readTestBed.ioDescriptor, with: readIO
             )
-            #expect(Array(readData) == testData)
+            #expect(readData == testData)
         } writer: { writeIO, writeTestBed in
-            _ = try await writeIO.write(testData, to: writeTestBed.ioChannel)
+            _ = try await writeIO.write(testData, to: writeTestBed.ioDescriptor)
             try await writeTestBed.finish()
         }
     }
@@ -142,8 +151,8 @@ extension SubprocessAsyncIOTests {
     @Test(.disabled("Cannot safely write to a closed fd without risking it being reused"))
     func testWriteToClosedPipe() async throws {
         var pipe = try CreatedPipe(closeWhenDone: true, purpose: .input)
-        var writeChannel = try _require(pipe.writeFileDescriptor()).createIOChannel()
-        var readChannel = try _require(pipe.readFileDescriptor()).createIOChannel()
+        var writeChannel = try _require(pipe.writeFileDescriptor())
+        var readChannel = try _require(pipe.readFileDescriptor())
         defer {
             try? readChannel.safelyClose()
         }
@@ -161,7 +170,7 @@ extension SubprocessAsyncIOTests {
             }
 
             #if os(Windows)
-            #expect(subprocessError.underlyingError == SubprocessError.WindowsError(rawValue: DWORD(ERROR_INVALID_HANDLE)))
+            #expect(subprocessError.underlyingError == SubprocessError.WindowsError(win32Error: DWORD(ERROR_INVALID_HANDLE)))
             #elseif canImport(Darwin) || os(FreeBSD) || os(OpenBSD)
             #expect(subprocessError.underlyingError == Errno(rawValue: ECANCELED))
             #else
@@ -179,8 +188,8 @@ extension SubprocessAsyncIOTests {
     @Test(.disabled("Cannot safely read from a closed fd without risking it being reused"))
     func testReadFromClosedPipe() async throws {
         var pipe = try CreatedPipe(closeWhenDone: true, purpose: .input)
-        var writeChannel = try _require(pipe.writeFileDescriptor()).createIOChannel()
-        var readChannel = try _require(pipe.readFileDescriptor()).createIOChannel()
+        var writeChannel = try _require(pipe.writeFileDescriptor())
+        var readChannel = try _require(pipe.readFileDescriptor())
         defer {
             try? writeChannel.safelyClose()
         }
@@ -188,7 +197,7 @@ extension SubprocessAsyncIOTests {
         try readChannel.safelyClose()
 
         await #expect {
-            _ = try await AsyncIO.shared.read(from: readChannel, upTo: .max)
+            _ = try await AsyncIO.shared.read(from: readChannel, upTo: 1024)
         } throws: { error in
             guard let subprocessError = error as? SubprocessError else {
                 return false
@@ -199,7 +208,7 @@ extension SubprocessAsyncIOTests {
 
             #if os(Windows)
             #expect(
-                subprocessError.underlyingError == SubprocessError.WindowsError(rawValue: DWORD(ERROR_INVALID_HANDLE)))
+                subprocessError.underlyingError == SubprocessError.WindowsError(win32Error: DWORD(ERROR_INVALID_HANDLE)))
             #elseif canImport(Darwin) || os(FreeBSD) || os(OpenBSD)
             #expect(
                 subprocessError.underlyingError == Errno(rawValue: ECANCELED)
@@ -218,14 +227,255 @@ extension SubprocessAsyncIOTests {
     @Test func testBinaryDataWithNullBytes() async throws {
         let binaryData: [UInt8] = [0x00, 0x01, 0x02, 0x00, 0xFF, 0x00, 0xFE, 0xFD]
         try await runReadWriteTest { readIO, readTestBed in
-            let readData = try #require(
-                try await readIO.read(from: readTestBed.ioChannel, upTo: .max)
+            let readData = try await readUntilEOF(
+                from: readTestBed.ioDescriptor, with: readIO
             )
             #expect(Array(readData) == binaryData)
         } writer: { writeIO, writeTestBed in
-            let written = try await writeIO.write(binaryData, to: writeTestBed.ioChannel)
+            let written = try await writeIO.write(binaryData, to: writeTestBed.ioDescriptor)
             #expect(written == binaryData.count)
             try await writeTestBed.finish()
+        }
+    }
+}
+
+// MARK: - Cancellation Tests
+extension SubprocessAsyncIOTests {
+    @Test(.timeLimit(.minutes(1)))
+    func testReadDrainsBufferedDataAfterCancellation() async throws {
+        let payload = randomData(count: 1024)
+        let io = AsyncIO.shared
+        defer {
+            io.cleanup(processIdentifier: _currentPID)
+        }
+
+        var pipe = try CreatedPipe(closeWhenDone: true, purpose: .input)
+        let readTestBed = try TestBed(ioDescriptor: _require(pipe.readFileDescriptor()))
+        let writeTestBed = try TestBed(ioDescriptor: _require(pipe.writeFileDescriptor()))
+
+        // Buffer the payload with no read pending. It fits comfortably within
+        // the pipe capacity, so the write completes without a reader.
+        let written = try await io.write(payload, to: writeTestBed.ioDescriptor)
+        #expect(written == payload.count)
+
+        // Stand in for the termination monitor: the child has exited, so the
+        // run cancels its I/O while bytes are still buffered.
+        try io.cancelAsyncIO(for: _currentPID)
+
+        let drained = try await io.read(
+            from: readTestBed.ioDescriptor,
+            upTo: payload.count
+        )
+
+        // Close promptly to bound any dangling-I/O window on a backend that
+        // issues a read on the cancelled path without awaiting completion.
+        try await readTestBed.finish()
+        try await writeTestBed.finish()
+
+        let bytes = try #require(
+            drained,
+            "read returned nil while \(payload.count) bytes were buffered: the cancelled path dropped them instead of draining"
+        )
+        #expect(bytes == payload)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func testReadDrainsBufferedDataAfterCancellationOnAttachedHandle() async throws {
+        let firstChunk = randomData(count: 1024)
+        let secondChunk = randomData(count: 1024)
+        let io = AsyncIO.shared
+        defer {
+            io.cleanup(processIdentifier: _currentPID)
+        }
+
+        var pipe = try CreatedPipe(closeWhenDone: true, purpose: .input)
+        let readTestBed = try TestBed(ioDescriptor: _require(pipe.readFileDescriptor()))
+        let writeTestBed = try TestBed(ioDescriptor: _require(pipe.writeFileDescriptor()))
+
+        // Both chunks sit in the pipe buffer together.
+        let written = try await io.write(firstChunk + secondChunk, to: writeTestBed.ioDescriptor)
+        #expect(written == firstChunk.count + secondChunk.count)
+
+        // A first, uncancelled read attaches the descriptor and consumes the
+        // first chunk.
+        let first = try await io.read(from: readTestBed.ioDescriptor, upTo: firstChunk.count)
+        #expect(first == firstChunk)
+
+        // Cancel while the second chunk is still buffered.
+        try io.cancelAsyncIO(for: _currentPID)
+
+        // The cancelled read must drain the second chunk from the now-cancelled,
+        // already-attached descriptor.
+        let second = try await io.read(from: readTestBed.ioDescriptor, upTo: secondChunk.count)
+
+        try await readTestBed.finish()
+        try await writeTestBed.finish()
+
+        let drained = try #require(
+            second,
+            "read returned nil while \(secondChunk.count) buffered bytes remained on an already-attached descriptor: the cancelled path dropped them"
+        )
+        #expect(drained == secondChunk)
+    }
+}
+
+// MARK: - Partial Read/Write, Backpressure & Boundary Tests
+extension SubprocessAsyncIOTests {
+    // Ported intent: swift-nio NonBlockingFileIOTest.testReadingShortWorks.
+    // AsyncIO returns after a single underlying read, so a request larger than
+    // what's available yields a SHORT read rather than blocking for the full
+    // amount.
+    @Test func testShortRead() async throws {
+        let payload = randomData(count: 64)
+        try await runReadWriteTest { readIO, readTestBed in
+            let chunk = try await readIO.read(from: readTestBed.ioDescriptor, upTo: 64 * 1024)
+            #expect(chunk == payload)
+        } writer: { writeIO, writeTestBed in
+            _ = try await writeIO.write(payload, to: writeTestBed.ioDescriptor)
+            try await writeTestBed.finish()
+        }
+    }
+
+    // Ported intent: swift-nio ChannelTests.testPendingWritesWorkWithPartialWrites.
+    // A write much larger than the pipe buffer must fill the pipe, block on
+    // EAGAIN, wait for the reader to drain, and resume looping until every
+    // byte is written. The reader drains in small, delayed chunks to keep the
+    // pipe full and force many wait cycles. Asserts the write reports the full
+    // count (proving the partial-write loop) and the bytes survive intact.
+    @Test func testWriteCompletesUnderBackpressure() async throws {
+        let payload = randomData(count: 512 * 1024)
+        try await runReadWriteTest { readIO, readTestBed in
+            var received: [UInt8] = []
+            while let chunk = try await readIO.read(from: readTestBed.ioDescriptor, upTo: 16 * 1024) {
+                received.append(contentsOf: chunk)
+                try await readTestBed.delay(.milliseconds(1))
+            }
+            #expect(received == payload)
+        } writer: { writeIO, writeTestBed in
+            let written = try await writeIO.write(payload, to: writeTestBed.ioDescriptor)
+            #expect(written == payload.count)
+            try await writeTestBed.finish()
+        }
+    }
+
+    // Ported intent: swift-nio NonBlockingFileIOTest.testReadManyChunks
+    // (2000 × 1-byte reads). Reading one byte at a time must deliver every byte
+    // in order with no loss or misalignment.
+    @Test func testReadManyTinyChunks() async throws {
+        let payload = randomData(count: 2048)
+        try await runReadWriteTest { readIO, readTestBed in
+            var received: [UInt8] = []
+            while let chunk = try await readIO.read(from: readTestBed.ioDescriptor, upTo: 1) {
+                received.append(contentsOf: chunk)
+            }
+            #expect(received == payload)
+        } writer: { writeIO, writeTestBed in
+            _ = try await writeIO.write(payload, to: writeTestBed.ioDescriptor)
+            try await writeTestBed.finish()
+        }
+    }
+
+    // Ported intent: swift-nio PipeChannelTest.testWriteEndGoingAway.
+    // Data written before the write end closes must be fully delivered, and only
+    // then EOF (`nil`) which exercises AsyncIO's final-drain path. Ordered
+    // deterministically (write + close, then read) via a manually-wired pipe.
+    @Test func testReadDrainsBufferedDataThenEOF() async throws {
+        var pipe = try CreatedPipe(closeWhenDone: true, purpose: .input)
+        var writeChannel = try _require(pipe.writeFileDescriptor())
+        var readChannel = try _require(pipe.readFileDescriptor())
+        defer {
+            try? readChannel.safelyClose()
+        }
+
+        let payload = randomData(count: 4096)
+        // Write everything, then close the write end so the reader observes
+        // buffered data followed by EOF (not EOF first).
+        _ = try await AsyncIO.shared.write(payload, to: writeChannel)
+        try writeChannel.safelyClose()
+
+        var received: [UInt8] = []
+        while let chunk = try await AsyncIO.shared.read(from: readChannel, upTo: 64 * 1024) {
+            received.append(contentsOf: chunk)
+        }
+        #expect(received == payload)
+    }
+
+    // Reading with `upTo: .max` exercises the branch where AsyncIO sizes its
+    // buffer from `queryPipeBufferSize` instead of the requested length. It must
+    // return a (short) chunk rather than over-allocating or hanging.
+    @Test func testReadUpToMax() async throws {
+        let payload = randomData(count: 100)
+        try await runReadWriteTest { readIO, readTestBed in
+            var received: [UInt8] = []
+            while let chunk = try await readIO.read(from: readTestBed.ioDescriptor, upTo: .max) {
+                received.append(contentsOf: chunk)
+            }
+            #expect(received == payload)
+        } writer: { writeIO, writeTestBed in
+            _ = try await writeIO.write(payload, to: writeTestBed.ioDescriptor)
+            try await writeTestBed.finish()
+        }
+    }
+
+    @Test func testQueryPipeBufferSizeIsPositive() async throws {
+        var pipe = try CreatedPipe(closeWhenDone: true, purpose: .input)
+        var writeChannel = try _require(pipe.writeFileDescriptor())
+        var readChannel = try _require(pipe.readFileDescriptor())
+        defer {
+            try? writeChannel.safelyClose()
+            try? readChannel.safelyClose()
+        }
+        #expect(AsyncIO.queryPipeBufferSize(for: readChannel.descriptor()) > 0)
+        #expect(AsyncIO.queryPipeBufferSize(for: writeChannel.descriptor()) > 0)
+    }
+}
+
+// MARK: - Concurrency & Write-Error Tests
+extension SubprocessAsyncIOTests {
+    // Ported intent: swift-nio concurrent read/write tests. Drives many
+    // independent pipe round-trips through the shared `AsyncIO` at once to
+    // stress its registration/signal machinery for races.
+    @Test func testConcurrentReadWriteAcrossManyPipes() async throws {
+        let pipeCount = 32
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<pipeCount {
+                group.addTask {
+                    let payload = randomData(count: Int.random(in: 1..<8192))
+                    try await self.runReadWriteTest { readIO, readTestBed in
+                        let received = try await self.readUntilEOF(
+                            from: readTestBed.ioDescriptor, with: readIO
+                        )
+                        #expect(received == payload)
+                    } writer: { writeIO, writeTestBed in
+                        _ = try await writeIO.write(payload, to: writeTestBed.ioDescriptor)
+                        try await writeTestBed.finish()
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
+
+    // Ported intent: swift-nio PipeChannelTest.testWriteErrorsCloseChannel /
+    // testReadEndGoingAway. Writing to a pipe whose read end has gone away must
+    // surface as a write error rather than hang or silently succeed.
+    @Test func testWriteToPipeWithClosedReadEndThrows() async throws {
+        var pipe = try CreatedPipe(closeWhenDone: true, purpose: .input)
+        var writeChannel = try _require(pipe.writeFileDescriptor())
+        var readChannel = try _require(pipe.readFileDescriptor())
+        defer {
+            try? writeChannel.safelyClose()
+        }
+        // Close the read end; the write descriptor remains valid and ours.
+        try readChannel.safelyClose()
+
+        await #expect {
+            _ = try await AsyncIO.shared.write(randomData(count: 64 * 1024), to: writeChannel)
+        } throws: { error in
+            guard let subprocessError = error as? SubprocessError else {
+                return false
+            }
+            return subprocessError.code == .init(.failedToWriteToSubprocess)
         }
     }
 }
@@ -233,10 +483,13 @@ extension SubprocessAsyncIOTests {
 // MARK: - Utils
 extension SubprocessAsyncIOTests {
     final class TestBed: Sendable {
-        let ioChannel: Subprocess.IOChannel
+        let ioDescriptor: Subprocess.IODescriptor
 
-        init(ioChannel: consuming Subprocess.IOChannel) {
-            self.ioChannel = ioChannel
+        init(ioDescriptor: consuming Subprocess.IODescriptor) {
+            var updated = consume ioDescriptor
+            // TestBed.finish calls `_safelyClose()` directly
+            updated.closeWhenDone = false
+            self.ioDescriptor = updated
         }
     }
 }
@@ -250,19 +503,16 @@ extension SubprocessAsyncIOTests {
             // First create the pipe
             var pipe = try CreatedPipe(closeWhenDone: true, purpose: .input)
 
-            let readChannel: IOChannel? = pipe.readFileDescriptor()?.createIOChannel()
-            let writeChannel: IOChannel? = pipe.writeFileDescriptor()?.createIOChannel()
-
-            var readBox: IOChannel? = consume readChannel
-            var writeBox: IOChannel? = consume writeChannel
+            var readDescriptor: IODescriptor? = pipe.readFileDescriptor()
+            var writeDescriptor: IODescriptor? = pipe.writeFileDescriptor()
 
             let readIO = AsyncIO.shared
             let writeIO = AsyncIO()
 
             // Create TestBeds in outer scope so both pipe endpoints
             // stay alive until both tasks complete
-            let readTestBed = try TestBed(ioChannel: _require(readBox.take()))
-            let writeTestBed = try TestBed(ioChannel: _require(writeBox.take()))
+            let readTestBed = try TestBed(ioDescriptor: _require(readDescriptor.take()))
+            let writeTestBed = try TestBed(ioDescriptor: _require(writeDescriptor.take()))
 
             group.addTask {
                 try await reader(readIO, readTestBed)
@@ -273,7 +523,7 @@ extension SubprocessAsyncIOTests {
 
             try await group.waitForAll()
             // Keep both pipe endpoints alive until both tasks complete,
-            // preventing the DispatchIO cleanup handler from closing
+            // preventing the cleanup handler from closing
             // a pipe fd while the other task is still using it.
             withExtendedLifetime((readTestBed, writeTestBed)) {}
             // Teardown
@@ -281,20 +531,98 @@ extension SubprocessAsyncIOTests {
             writeIO.shutdown()
         }
     }
+
+    func readUntilEOF(
+        from ioDescriptor: borrowing IODescriptor,
+        with asyncIO: AsyncIO
+    ) async throws -> [UInt8] {
+        var result: [UInt8] = []
+        let bufferSize = AsyncIO.queryPipeBufferSize(
+            for: ioDescriptor.descriptor()
+        )
+        while let chunk = try await asyncIO.read(from: ioDescriptor, upTo: bufferSize) {
+            result.append(contentsOf: chunk)
+        }
+        return result
+    }
+
+    func read(
+        until readLength: Int,
+        from ioDescriptor: borrowing IODescriptor,
+        with asyncIO: AsyncIO
+    ) async throws -> [UInt8] {
+        guard readLength < .max else {
+            fatalError("Use readUntilEOF instead")
+        }
+        var result: [UInt8] = []
+        result.reserveCapacity(readLength)
+        let bufferSize = AsyncIO.queryPipeBufferSize(
+            for: ioDescriptor.descriptor()
+        )
+        while result.count < readLength {
+            let targetLength = min(bufferSize, readLength - result.count)
+            guard
+                let chunk = try await asyncIO.read(
+                    from: ioDescriptor, upTo: targetLength
+                )
+            else {
+                break
+            }
+            result.append(contentsOf: chunk)
+        }
+        return result
+    }
 }
 
 extension SubprocessAsyncIOTests.TestBed {
     consuming func finish() async throws {
-        #if SUBPROCESS_ASYNCIO_DISPATCH
-        try _safelyClose(.dispatchIO(self.ioChannel.channel))
-        #elseif canImport(WinSDK)
-        try _safelyClose(.handle(self.ioChannel.channel))
+        #if canImport(WinSDK)
+        try _safelyClose(.handle(self.ioDescriptor.descriptor()))
         #else
-        try _safelyClose(.fileDescriptor(self.ioChannel.channel))
+        try _safelyClose(.fileDescriptor(self.ioDescriptor.descriptor()))
         #endif
     }
 
     func delay(_ duration: Duration) async throws {
         try await Task.sleep(for: duration)
+    }
+}
+
+/// A `ProcessIdentifier` for the current test process.
+///
+/// The AsyncIO-only tests below never spawn a child, so they have no
+/// real `ProcessIdentifier` to pass. The tests only call `read` and
+/// `write` (never `cancelAsyncIO`), so this stand-in is sufficient.
+private var _currentPID: ProcessIdentifier {
+    #if os(Windows)
+    return ProcessIdentifier(
+        value: GetCurrentProcessId(),
+        processDescriptor: GetCurrentProcess(),
+        threadHandle: GetCurrentThread(),
+        jobHandle: INVALID_HANDLE_VALUE
+    )
+    #elseif canImport(Darwin)
+    return ProcessIdentifier(value: getpid())
+    #else
+    return ProcessIdentifier(
+        value: getpid(),
+        processDescriptor: 0 // Not used in these tests.
+    )
+    #endif
+}
+
+extension AsyncIO {
+    func write(
+        _ array: [UInt8],
+        to diskIO: borrowing IODescriptor
+    ) async throws(SubprocessError) -> Int {
+        return try await self.write(array._bytes, to: diskIO, for: _currentPID)
+    }
+
+    func read(
+        from diskIO: borrowing IODescriptor,
+        upTo maxLength: Int
+    ) async throws(SubprocessError) -> [UInt8]? {
+        return try await self.read(from: diskIO, for: _currentPID, upTo: maxLength)
     }
 }

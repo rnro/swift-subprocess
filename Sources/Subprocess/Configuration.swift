@@ -27,12 +27,8 @@ import Musl
 @preconcurrency public import WinSDK
 #endif
 
-internal import Dispatch
-
-import Synchronization
-
 /// A collection of configuration parameters to use when
-/// spawning a subprocess.
+/// running a subprocess.
 public struct Configuration: Sendable {
     /// The executable to run.
     public var executable: Executable
@@ -42,14 +38,14 @@ public struct Configuration: Sendable {
     public var environment: Environment
     /// The working directory to use when running the executable.
     ///
-    /// If this property is `nil`, the subprocess will inherit
-    /// the working directory from the parent process.
+    /// If this property is `nil`, the subprocess inherits the working
+    /// directory from the calling process.
     public var workingDirectory: FilePath?
     /// The platform-specific options to use when
     /// running the subprocess.
     public var platformOptions: PlatformOptions
 
-    /// Creates a Configuration with the parameters you provide.
+    /// Creates a configuration with the parameters you provide.
     /// - Parameters:
     ///   - executable: The executable to run.
     ///   - arguments: The arguments to pass to the executable.
@@ -70,82 +66,128 @@ public struct Configuration: Sendable {
         self.platformOptions = platformOptions
     }
 
-    public init(
-        _ executable: Executable,
-        arguments: Arguments = [],
-        environment: Environment = .inherit,
-        workingDirectory: FilePath? = nil,
-        platformOptions: PlatformOptions = PlatformOptions()
-    ) {
-        self.init(
-            executable: executable,
-            arguments: arguments,
-            environment: environment,
-            workingDirectory: workingDirectory,
-            platformOptions: platformOptions
-        )
-    }
-
-    internal func run<Result>(
+    internal func run<
+        Result: ~Copyable & Sendable,
+        Input: InputProtocol,
+        Output: OutputProtocol,
+        Error: OutputProtocol
+    >(
         input: consuming CreatedPipe,
+        as inputType: Input.Type,
         output: consuming CreatedPipe,
+        as outputType: Output.Type,
         error: consuming CreatedPipe,
+        as errorType: Error.Type,
         _ body: (
             (
-                Execution,
-                consuming IOChannel?,
-                consuming IOChannel?,
-                consuming IOChannel?
+                ProcessIdentifier,
+                consuming IODescriptor?,
+                consuming IODescriptor?,
+                consuming IODescriptor?
             ) async throws -> Result
         )
     ) async throws -> ExecutionOutcome<Result> {
-        let spawnResults = try await self.spawn(
+        var spawnResults = try await self.spawn(
             withInput: input,
             outputPipe: output,
             errorPipe: error
         )
 
-        var spawnResultBox: SpawnResult?? = consume spawnResults
-        var _spawnResult = spawnResultBox!.take()!
+        let processIdentifier = spawnResults.processIdentifier
 
-        let execution = _spawnResult.execution
         defer {
-            // Close process file descriptor now we finished monitoring
-            execution.processIdentifier.close()
+            // Close the process file descriptor now that monitoring has finished.
+            processIdentifier.close()
         }
 
         return try await withAsyncTaskCleanupHandler { () throws -> ExecutionOutcome<Result> in
-            let inputIO = _spawnResult.inputWriteEnd()
-            let outputIO = _spawnResult.outputReadEnd()
-            let errorIO = _spawnResult.errorReadEnd()
+            // The counter coordinates a race between two finishers: the body
+            // closure and the process-termination monitor. Whichever side
+            // increments first observes a value of `1` and owns the response;
+            // the other side sees `2` and stays out of the way.
+            //
+            // If the monitor wins, the child has exited while the body is
+            // still reading or writing. The body might be blocked on a pipe
+            // that an inherited grandchild keeps open, so the monitor calls
+            // `cancelAsyncIO` to unblock it. If the body wins, the I/O
+            // already finished cleanly and no cancellation is needed.
+            let taskFinishFlag = AtomicCounter()
 
-            let result: Swift.Result<Result, any Error>
-            do {
-                // Body runs in the same isolation
-                let bodyResult = try await body(_spawnResult.execution, inputIO, outputIO, errorIO)
-                result = .success(bodyResult)
-            } catch {
-                result = .failure(error)
+            // The body's result is moved out through this box rather than
+            // returned from the task group since a noncopyable `Result` can't be a
+            // `GroupResult`. The group returns only the (copyable) monitor error.
+            var resultBox: Swift.Result<Result, any Swift.Error>? = nil
+            let monitorError = try await withThrowingTaskGroup(
+                of: SubprocessError?.self,
+                returning: SubprocessError?.self
+            ) { group in
+                group.addTask {
+                    do throws(SubprocessError) {
+                        try await waitForProcessTermination(for: processIdentifier)
+                        if taskFinishFlag.addOne() == 1 {
+                            // The body closure hasn't finished but the child
+                            // process has terminated. Cancel all active
+                            // AsyncIO now.
+                            try AsyncIO.shared.cancelAsyncIO(for: processIdentifier)
+                        }
+                        return nil
+                    } catch {
+                        try? AsyncIO.shared.cancelAsyncIO(for: processIdentifier)
+                        return error
+                    }
+                }
+
+                let inputIO = spawnResults.inputWriteEnd()
+                let outputIO = spawnResults.outputReadEnd()
+                let errorIO = spawnResults.errorReadEnd()
+
+                do {
+                    // Body runs in the same isolation.
+                    let bodyResult = try await body(processIdentifier, inputIO, outputIO, errorIO)
+                    taskFinishFlag.addOne()
+                    resultBox = .success(bodyResult)
+                } catch {
+                    let execution = Execution<Input, Output, Error>(
+                        processIdentifier: processIdentifier,
+                        inputWriter: nil,
+                        outputStream: nil,
+                        errorStream: nil
+                    )
+                    // Attempt to terminate the child process when the body throws
+                    await execution.teardown(using: self.platformOptions.teardownSequence)
+                    resultBox = .failure(error)
+                }
+
+                // Wait for the monitor child task to finish.
+                return try await group.next() ?? nil
             }
 
-            // Ensure that we begin monitoring process termination after `body` runs
-            // and regardless of whether `body` throws, so that the pid gets reaped
-            // even if `body` throws, and we are not leaving zombie processes in the
-            // process table which will cause the process termination monitoring thread
-            // to effectively hang due to the pid never being awaited
-            let terminationStatus = try await monitorProcessTermination(
-                for: execution.processIdentifier
-            )
+            // Drop the cancellation marker before reaping the zombie. After
+            // `reapProcess` runs the kernel can immediately reuse this PID,
+            // so the marker must be gone first; otherwise a concurrent
+            // `run()` that happens to inherit the same PID would see the
+            // stale entry and reject its registrations.
+            AsyncIO.shared.cleanup(processIdentifier: processIdentifier)
 
-            return ExecutionOutcome(
+            let terminationStatus = try reapProcess(with: processIdentifier)
+
+            if let monitorError {
+                throw monitorError
+            }
+
+            return try ExecutionOutcome(
                 terminationStatus: terminationStatus,
-                value: try result.get()
+                value: resultBox.take()!.get()
             )
         } onCleanup: {
-            // Attempt to terminate the child process
-            await execution.runTeardownSequence(
-                self.platformOptions.teardownSequence
+            let execution = Execution<Input, Output, Error>(
+                processIdentifier: processIdentifier,
+                inputWriter: nil,
+                outputStream: nil,
+                errorStream: nil
             )
+            // Attempt to terminate the child process.
+            await execution.teardown(using: self.platformOptions.teardownSequence)
         }
     }
 }
@@ -181,7 +223,7 @@ extension Configuration: CustomStringConvertible, CustomDebugStringConvertible {
 
 // MARK: - Cleanup
 extension Configuration {
-    /// Close each input individually, and throw the first error if there's multiple errors thrown
+    /// Close each input individually, and throw the first error if there are multiple errors thrown
     @Sendable
     internal func safelyCloseMultiple(
         inputRead: consuming IODescriptor?,
@@ -200,17 +242,17 @@ extension Configuration {
         // as opposed to actually try to close it.
         var remainingSet: Set<IODescriptor.Descriptor> = Set(
             optionalSequence: [
-                inputRead?.descriptor,
-                inputWrite?.descriptor,
-                outputRead?.descriptor,
-                outputWrite?.descriptor,
-                errorRead?.descriptor,
-                errorWrite?.descriptor,
+                inputRead?.descriptor(),
+                inputWrite?.descriptor(),
+                outputRead?.descriptor(),
+                outputWrite?.descriptor(),
+                errorRead?.descriptor(),
+                errorWrite?.descriptor(),
             ]
         )
 
         do {
-            if remainingSet.tryRemove(inputRead?.descriptor) {
+            if remainingSet.tryRemove(inputRead?.descriptor()) {
                 try inputRead?.safelyClose()
             } else {
                 try inputRead?.markAsClosed()
@@ -219,7 +261,7 @@ extension Configuration {
             possibleError = error
         }
         do {
-            if remainingSet.tryRemove(inputWrite?.descriptor) {
+            if remainingSet.tryRemove(inputWrite?.descriptor()) {
                 try inputWrite?.safelyClose()
             } else {
                 try inputWrite?.markAsClosed()
@@ -228,7 +270,7 @@ extension Configuration {
             possibleError = error
         }
         do {
-            if remainingSet.tryRemove(outputRead?.descriptor) {
+            if remainingSet.tryRemove(outputRead?.descriptor()) {
                 try outputRead?.safelyClose()
             } else {
                 try outputRead?.markAsClosed()
@@ -237,7 +279,7 @@ extension Configuration {
             possibleError = error
         }
         do {
-            if remainingSet.tryRemove(outputWrite?.descriptor) {
+            if remainingSet.tryRemove(outputWrite?.descriptor()) {
                 try outputWrite?.safelyClose()
             } else {
                 try outputWrite?.markAsClosed()
@@ -246,7 +288,7 @@ extension Configuration {
             possibleError = error
         }
         do {
-            if remainingSet.tryRemove(errorRead?.descriptor) {
+            if remainingSet.tryRemove(errorRead?.descriptor()) {
                 try errorRead?.safelyClose()
             } else {
                 try errorRead?.markAsClosed()
@@ -255,7 +297,7 @@ extension Configuration {
             possibleError = error
         }
         do {
-            if remainingSet.tryRemove(errorWrite?.descriptor) {
+            if remainingSet.tryRemove(errorWrite?.descriptor()) {
                 try errorWrite?.safelyClose()
             } else {
                 try errorWrite?.markAsClosed()
@@ -286,19 +328,103 @@ public struct Executable: Sendable, Hashable {
     }
 
     /// Locates the executable by name.
-    /// The subprocess uses the `PATH` value to determine the full path.
+    ///
+    /// Subprocess searches for the executable by name in the directories listed
+    /// in the `PATH` environment variable, in order, and runs the first match it
+    /// finds. To run an executable at a known location instead, use ``path(_:)``.
+    ///
+    /// The search uses the `PATH` of the environment you pass to the subprocess,
+    /// falling back to the `PATH` of the current process when that environment
+    /// doesn't set one, and to the directories the platform considers standard
+    /// when neither sets one. Only absolute directories are searched: Subprocess
+    /// skips empty and relative `PATH` entries, and never searches the current
+    /// working directory of either process. The working directory you pass to
+    /// `run` therefore has no effect on which executable runs.
+    ///
+    /// The executable name must be a name, not a path: passing a name that
+    /// contains a path separator throws a ``SubprocessError`` with the code
+    /// ``SubprocessError/Code/spawnFailed``. Use ``path(_:)`` for a location.
     public static func name(_ executableName: String) -> Self {
         return .init(_config: .executable(executableName))
     }
     /// Locates the executable by its full file path.
+    ///
     /// The subprocess uses this path directly.
     public static func path(_ filePath: FilePath) -> Self {
         return .init(_config: .path(filePath))
     }
-    /// Resolves the full executable path using the given environment.
-    public func resolveExecutablePath(in environment: Environment) throws(SubprocessError) -> FilePath {
-        let path = try self.resolveExecutablePath(withPathValue: environment.pathValue())
-        return FilePath(path)
+    /// Resolves the full executable path using the environment you provide.
+    ///
+    /// For an executable created with ``name(_:)``, this searches `PATH` the
+    /// same way running the subprocess does, and returns an absolute path.
+    /// An executable created with ``path(_:)`` is returned unchanged, without
+    /// checking whether anything exists there.
+    ///
+    /// - Throws: ``SubprocessError`` with the code
+    ///   ``SubprocessError/Code/executableNotFound`` when no directory on
+    ///   `PATH` holds a matching executable, or
+    ///   ``SubprocessError/Code/spawnFailed`` when the name contains a path
+    ///   separator.
+    public func resolveExecutablePath(in environment: Environment) async throws(SubprocessError) -> FilePath {
+        try await runOnBackgroundThread { () throws(SubprocessError) -> FilePath in
+            let path = try self.resolveExecutablePath(withPathValue: environment.pathValue())
+            return FilePath(path)
+        }
+    }
+}
+
+// MARK: - Executable Name Resolution Policy
+
+extension Executable {
+    #if os(Windows)
+    /// The character that separates one directory from the next in a `PATH`
+    /// value.
+    internal static let pathValueSeparator: Character = ";"
+    /// The characters that name a location, and so may not appear in a name
+    /// passed to ``name(_:)``.
+    ///
+    /// Windows accepts either slash as a separator, and `:` separates a drive
+    /// from a drive-relative path, so `C:tool` names a location in the same way
+    /// `.\tool` does.
+    internal static let pathSeparators: [Character] = ["/", "\\", ":"]
+    #else
+    /// The character that separates one directory from the next in a `PATH`
+    /// value.
+    internal static let pathValueSeparator: Character = ":"
+    /// The characters that name a location, and so may not appear in a name
+    /// passed to ``name(_:)``.
+    internal static let pathSeparators: [Character] = ["/"]
+    #endif
+
+    /// Rejects a name that names a location rather than an executable.
+    ///
+    /// A name containing a path separator is ambiguous: it reads as a name to
+    /// look up on `PATH` and as a path to resolve against some current
+    /// directory, and the two answers differ. ``path(_:)`` expresses the
+    /// second intent unambiguously.
+    internal static func validate(name: String) throws(SubprocessError) {
+        guard let separator = name.first(where: { Self.pathSeparators.contains($0) }) else {
+            return
+        }
+        throw SubprocessError.spawnFailed(
+            withUnderlyingError: nil,
+            reason: """
+                Executable name "\(name)" must not contain the path separator "\(separator)". \
+                Executable.name(_:) looks a name up in the directories listed in PATH; \
+                use Executable.path(_:) to run an executable at a known location.
+                """
+        )
+    }
+
+    internal static func searchPaths(withPathValue pathValue: String?) -> [String] {
+        guard let pathValue else {
+            return Self.defaultSearchPaths
+        }
+        // `split` omits empty subsequences, dropping the empty entries that a
+        // leading, trailing, or doubled separator introduces.
+        return pathValue.split(separator: Self.pathValueSeparator)
+            .map(String.init)
+            .filter { FilePath($0).isAbsolute }
     }
 }
 
@@ -334,19 +460,19 @@ public struct Arguments: Sendable, ExpressibleByArrayLiteral, Hashable {
     internal let storage: [StringOrRawBytes]
     internal let executablePathOverride: StringOrRawBytes?
 
-    /// Creates an arguments value from the given literal values.
+    /// Creates an arguments value from the literal values you provide.
     public init(arrayLiteral elements: String...) {
         self.storage = elements.map { .string($0) }
         self.executablePathOverride = nil
     }
-    /// Creates an arguments value from the given array.
+    /// Creates an arguments value from the array you provide.
     public init(_ array: [String]) {
         self.storage = array.map { .string($0) }
         self.executablePathOverride = nil
     }
 
-    /// Creates an ``Arguments`` value using the given values, but
-    /// override the first argument value with `executablePathOverride`.
+    /// Creates an argument list, overriding the first element with the executable path value you provide.
+    ///
     /// If `executablePathOverride` is `nil`,
     /// ``Arguments`` automatically uses the executable path
     /// as the first argument.
@@ -362,8 +488,8 @@ public struct Arguments: Sendable, ExpressibleByArrayLiteral, Hashable {
         }
     }
     #if !os(Windows) // Windows does not support non-unicode arguments
-    /// Creates an ``Arguments`` value using the given values, but
-    /// override the first argument value with `executablePathOverride`.
+    /// Creates an argument list, overriding the first element with the executable path value you provide.
+    ///
     /// If `executablePathOverride` is `nil`,
     /// ``Arguments`` automatically uses the executable path
     /// as the first argument.
@@ -422,10 +548,10 @@ public struct Environment: Sendable, Hashable {
     public static var inherit: Self {
         return .init(config: .inherit([:]))
     }
-    /// Returns an updated environment that applies `newValue` to the current configuration.
+    /// Returns an updated environment with the overrides you provide applied.
     ///
     /// Keys with `nil` values in `newValue` remove the corresponding entry
-    /// from the environment before passing it to the child process.
+    /// from the environment before passing it to the subprocess.
     public func updating(_ newValue: [Key: String?]) -> Self {
         switch config {
         case .inherit(var overrides):
@@ -468,7 +594,7 @@ public struct Environment: Sendable, Hashable {
 }
 
 extension Environment: CustomStringConvertible, CustomDebugStringConvertible {
-    /// A key used to access values in an ``Environment``.
+    /// A key used to access values in the subprocess environment.
     ///
     /// This type respects the compiled platform's case sensitivity requirements.
     public struct Key {
@@ -544,10 +670,41 @@ extension Environment.Key {
 
 extension Environment.Key: CodingKeyRepresentable {}
 
+extension Environment.Key {
+    /// The value used for equality, hashing, and ordering.
+    private var _comparisonValue: String {
+        #if os(Windows)
+        // Windows treats environment-variable names case-insensitively and
+        // requires the environment block to be sorted in case-insensitive,
+        // ordinal order without regard to locale. Its ordinal case-insensitive
+        // comparison folds to uppercase, so '_' (0x5F), and the other scalars
+        // between 'Z' and 'a', sort after letters. Folding to uppercase here
+        // (a–z → A–Z) lands letters in 0x41–0x5A and matches that order;
+        // folding to lowercase would sort '_' before letters.
+        //
+        // The fold is ASCII-only and applies no Unicode case mapping, so unlike
+        // `uppercased()` it never expands a scalar ("ß" stays "ß", not "SS")
+        // and is stable across Unicode versions. It does not case-fold
+        // non-ASCII scalars the way Windows does, which is immaterial because
+        // environment-variable names are ASCII in practice.
+        return String(
+            String.UnicodeScalarView(
+                self.rawValue.unicodeScalars.map { scalar in
+                    (scalar.value >= 0x61 && scalar.value <= 0x7A)
+                        ? Unicode.Scalar(scalar.value - 0x20)! // a–z → A–Z; always valid
+                        : scalar
+                }
+            )
+        )
+        #else
+        return self.rawValue
+        #endif
+    }
+}
+
 extension Environment.Key: Comparable {
     public static func < (lhs: Self, rhs: Self) -> Bool {
-        // Even on windows use a stable sort order.
-        lhs.rawValue < rhs.rawValue
+        lhs._comparisonValue < rhs._comparisonValue
     }
 }
 
@@ -563,11 +720,7 @@ extension Environment.Key: Encodable {
 
 extension Environment.Key: Equatable {
     public static func == (_ lhs: Self, _ rhs: Self) -> Bool {
-        #if os(Windows)
-        lhs.rawValue.lowercased() == rhs.rawValue.lowercased()
-        #else
-        lhs.rawValue == rhs.rawValue
-        #endif
+        lhs._comparisonValue == rhs._comparisonValue
     }
 }
 
@@ -585,11 +738,7 @@ extension Environment.Key: Decodable {
 
 extension Environment.Key: Hashable {
     public func hash(into hasher: inout Hasher) {
-        #if os(Windows)
-        self.rawValue.lowercased().hash(into: &hasher)
-        #else
-        self.rawValue.hash(into: &hasher)
-        #endif
+        self._comparisonValue.hash(into: &hasher)
     }
 }
 
@@ -654,40 +803,104 @@ extension TerminationStatus: CustomStringConvertible, CustomDebugStringConvertib
 // MARK: - Internal
 
 extension Configuration {
-    /// After Spawn finishes, child side file descriptors
-    /// (input read, output write, error write) will be closed
-    /// by `spawn()`. It returns the parent side file descriptors
-    /// via `SpawnResult` to perform actual reads
+    /// The result of launching a subprocess, containing caller-side file descriptors.
+    ///
+    /// After `spawn()` finishes, it closes subprocess-side file descriptors
+    /// (input read, output write, error write). The caller-side file descriptors
+    /// are returned in this value to perform actual reads.
     internal struct SpawnResult: ~Copyable {
-        let execution: Execution
-        var _inputWriteEnd: IOChannel?
-        var _outputReadEnd: IOChannel?
-        var _errorReadEnd: IOChannel?
+        let processIdentifier: ProcessIdentifier
+        var _inputWriteEnd: IODescriptor?
+        var _outputReadEnd: IODescriptor?
+        var _errorReadEnd: IODescriptor?
 
         init(
-            execution: Execution,
-            inputWriteEnd: consuming IOChannel?,
-            outputReadEnd: consuming IOChannel?,
-            errorReadEnd: consuming IOChannel?
+            processIdentifier: ProcessIdentifier,
+            inputWriteEnd: consuming IODescriptor?,
+            outputReadEnd: consuming IODescriptor?,
+            errorReadEnd: consuming IODescriptor?
         ) {
-            self.execution = execution
+            self.processIdentifier = processIdentifier
             self._inputWriteEnd = consume inputWriteEnd
             self._outputReadEnd = consume outputReadEnd
             self._errorReadEnd = consume errorReadEnd
         }
 
-        mutating func inputWriteEnd() -> IOChannel? {
+        mutating func inputWriteEnd() -> IODescriptor? {
             return self._inputWriteEnd.take()
         }
 
-        mutating func outputReadEnd() -> IOChannel? {
+        mutating func outputReadEnd() -> IODescriptor? {
             return self._outputReadEnd.take()
         }
 
-        mutating func errorReadEnd() -> IOChannel? {
+        mutating func errorReadEnd() -> IODescriptor? {
             return self._errorReadEnd.take()
         }
     }
+
+    #if !os(Windows)
+    /// The maximum number of `fork`/`exec` attempts, including the first one,
+    /// before a transient, retryable spawn failure is surfaced to the caller.
+    private static let maxSpawnAttempts = 6
+    /// The base spawn-retry backoff in nanoseconds.
+    ///
+    /// The delay doubles each attempt up to ``spawnRetryBackoffCapNanoseconds``, with jitter applied.
+    private static let spawnRetryBackoffBaseNanoseconds: UInt64 = 1_000_000
+    /// The maximum spawn-retry backoff in nanoseconds.
+    private static let spawnRetryBackoffCapNanoseconds: UInt64 = 100_000_000
+
+    /// A jittered, capped exponential backoff (in nanoseconds) for the given
+    /// spawn attempt.
+    internal static func spawnRetryBackoffNanoseconds(forAttempt attempt: Int) -> UInt64 {
+        let shift = UInt64(min(attempt - 1, 16))
+        let ceiling = min(
+            spawnRetryBackoffCapNanoseconds,
+            spawnRetryBackoffBaseNanoseconds << shift
+        )
+        // Equal jitter: half fixed, half random, to de-synchronize concurrent
+        // retriers without collapsing the delay toward zero.
+        let half = ceiling / 2
+        return half + UInt64.random(in: 0...half)
+    }
+
+    /// Repeatedly invokes a closure with bounded jittered backoff until it succeeds or reaches the retry limit.
+    ///
+    /// Calls `attempt` repeatedly while `shouldRetryTransientFailure` returns `true`, up to ``maxSpawnAttempts`` times.
+    ///
+    /// `EAGAIN` from `clone3`/`fork`/`posix_spawn` means the kernel could not
+    /// create the task because a per-uid or system task-count limit was
+    /// momentarily reached. The condition is transient, so a bounded number of
+    /// retries is attempted before the failure is surfaced unchanged. Each
+    /// platform decides which failures are the clean, retryable fork-side case.
+    ///
+    /// The backoff runs here, in the async context between attempts, never
+    /// inside the spawn helper: that helper holds a process-wide fork lock with
+    /// signals blocked and runs on a single shared worker thread, so sleeping
+    /// there would stall every other spawn. On cancellation during the backoff,
+    /// retrying stops and the pending outcome is surfaced rather than throwing a
+    /// cancellation error into the spawn path.
+    internal func runSpawnAttemptsRetryingTransientFailure<Outcome: Sendable>(
+        _ attempt: () async throws(SubprocessError) -> Outcome,
+        shouldRetryTransientFailure shouldRetry: (Outcome) -> Bool
+    ) async throws(SubprocessError) -> Outcome {
+        var attemptNumber = 1
+        while true {
+            let outcome = try await attempt()
+            guard shouldRetry(outcome), attemptNumber < Self.maxSpawnAttempts else {
+                return outcome
+            }
+            do {
+                try await Task.sleep(
+                    nanoseconds: Self.spawnRetryBackoffNanoseconds(forAttempt: attemptNumber)
+                )
+            } catch {
+                return outcome
+            }
+            attemptNumber += 1
+        }
+    }
+    #endif
 }
 
 internal enum StringOrRawBytes: Sendable, Hashable {
@@ -760,7 +973,6 @@ internal enum _CloseTarget {
     #else
     case fileDescriptor(FileDescriptor)
     #endif
-    case dispatchIO(DispatchIO)
 }
 
 internal func _safelyClose(_ target: _CloseTarget) throws(SubprocessError) {
@@ -768,7 +980,7 @@ internal func _safelyClose(_ target: _CloseTarget) throws(SubprocessError) {
     #if os(Windows)
     case .handle(let handle):
         /// Windows does not provide a “deregistration” API (the reverse of
-        /// `CreateIoCompletionPort`) for handles and it reuses HANDLE
+        /// `CreateIoCompletionPort`) for handles, and it reuses HANDLE
         /// values once they are closed. Since we rely on the handle value
         /// as the completion key for `CreateIoCompletionPort`, we should
         /// remove the registration when the handle is closed to allow
@@ -788,13 +1000,17 @@ internal func _safelyClose(_ target: _CloseTarget) throws(SubprocessError) {
             }
             let subprocessError: SubprocessError = .asyncIOFailed(
                 reason: "Failed to close HANDLE",
-                underlyingError: SubprocessError.WindowsError(rawValue: error)
+                underlyingError: SubprocessError.WindowsError(win32Error: error)
             )
 
             throw subprocessError
         }
     #else
     case .fileDescriptor(let fileDescriptor):
+        // Detach from epoll/queue before closing. A descriptor stays registered
+        // with epoll/kqueue across reads and writes so a stream of buffers costs one registration,
+        // not one per buffer.
+        AsyncIO.shared.removeRegistration(for: fileDescriptor)
         do {
             try fileDescriptor.close()
         } catch {
@@ -822,18 +1038,16 @@ internal func _safelyClose(_ target: _CloseTarget) throws(SubprocessError) {
             )
         }
     #endif
-    case .dispatchIO(let dispatchIO):
-        dispatchIO.close()
     }
 }
 
-/// An IO descriptor wraps platform-specific file descriptor, which establishes a
+/// An IO descriptor wraps a platform-specific file descriptor, which establishes a
 /// connection to the standard input/output (IO) system during the process of
-/// spawning a child process.
+/// launching a subprocess.
 ///
 /// Unlike a file descriptor, the `IODescriptor` does not support
-/// data read/write operations; its primary function is to facilitate the spawning of
-/// child processes by providing a platform-specific file descriptor.
+/// data read/write operations; its primary function is to facilitate the launching of
+/// subprocesses by providing a platform-specific file descriptor.
 internal struct IODescriptor: ~Copyable {
     #if canImport(WinSDK)
     typealias Descriptor = HANDLE
@@ -843,16 +1057,16 @@ internal struct IODescriptor: ~Copyable {
 
     internal var closeWhenDone: Bool
     #if canImport(WinSDK)
-    internal nonisolated(unsafe) let descriptor: Descriptor
+    internal nonisolated(unsafe) let _descriptor: Descriptor
     #else
-    internal let descriptor: Descriptor
+    internal let _descriptor: Descriptor
     #endif
 
     internal init(
         _ descriptor: Descriptor,
         closeWhenDone: Bool
     ) {
-        self.descriptor = descriptor
+        self._descriptor = descriptor
         self.closeWhenDone = closeWhenDone
     }
 
@@ -867,36 +1081,13 @@ internal struct IODescriptor: ~Copyable {
 
     func duplicate() throws(SubprocessError) -> IODescriptor {
         do throws(any Error) {
-            return try IODescriptor(self.descriptor.duplicate(), closeWhenDone: self.closeWhenDone)
+            return try IODescriptor(self._descriptor.safeDuplicate(), closeWhenDone: self.closeWhenDone)
         } catch {
             throw SubprocessError.asyncIOFailed(
-                reason: "Failed to duplicate file descriptor \(self.descriptor)",
+                reason: "Failed to duplicate file descriptor \(self._descriptor)",
                 underlyingError: error as? SubprocessError.UnderlyingError
             )
         }
-    }
-
-    consuming func createIOChannel() -> IOChannel {
-        let shouldClose = self.closeWhenDone
-        self.closeWhenDone = false
-        #if SUBPROCESS_ASYNCIO_DISPATCH
-        // Transferring out the ownership of fileDescriptor means we don't have go close here
-        let closeFd = self.descriptor
-        let dispatchIO: DispatchIO = DispatchIO(
-            type: .stream,
-            fileDescriptor: self.platformDescriptor(),
-            queue: .global(),
-            cleanupHandler: { @Sendable error in
-                // Close the file descriptor
-                if shouldClose {
-                    try? closeFd.close()
-                }
-            }
-        )
-        return IOChannel(dispatchIO, closeWhenDone: shouldClose)
-        #else
-        return IOChannel(self.descriptor, closeWhenDone: shouldClose)
-        #endif
     }
 
     internal mutating func safelyClose() throws(SubprocessError) {
@@ -906,9 +1097,9 @@ internal struct IODescriptor: ~Copyable {
         closeWhenDone = false
 
         #if canImport(WinSDK)
-        try _safelyClose(.handle(self.descriptor))
+        try _safelyClose(.handle(self._descriptor))
         #else
-        try _safelyClose(.fileDescriptor(self.descriptor))
+        try _safelyClose(.fileDescriptor(self._descriptor))
         #endif
     }
 
@@ -921,64 +1112,31 @@ internal struct IODescriptor: ~Copyable {
             return
         }
 
-        fatalError("FileDescriptor \(self.descriptor) was not closed")
+        fatalError("FileDescriptor \(self._descriptor) was not closed")
     }
 
     internal func platformDescriptor() -> PlatformFileDescriptor {
         #if canImport(WinSDK)
-        return self.descriptor
+        return self._descriptor
         #else
-        return self.descriptor.platformDescriptor
-        #endif
-    }
-}
-
-internal struct IOChannel: ~Copyable, @unchecked Sendable {
-    #if SUBPROCESS_ASYNCIO_DISPATCH
-    typealias Channel = DispatchIO
-    #elseif canImport(WinSDK)
-    typealias Channel = HANDLE
-    #else
-    typealias Channel = FileDescriptor
-    #endif
-
-    internal var closeWhenDone: Bool
-    internal let channel: Channel
-
-    internal init(
-        _ channel: Channel,
-        closeWhenDone: Bool
-    ) {
-        self.channel = channel
-        self.closeWhenDone = closeWhenDone
-    }
-
-    internal mutating func safelyClose() throws(SubprocessError) {
-        guard self.closeWhenDone else {
-            return
-        }
-        closeWhenDone = false
-
-        #if SUBPROCESS_ASYNCIO_DISPATCH
-        try _safelyClose(.dispatchIO(self.channel))
-        #elseif canImport(WinSDK)
-        try _safelyClose(.handle(self.channel))
-        #else
-        try _safelyClose(.fileDescriptor(self.channel))
+        return self._descriptor.platformDescriptor
         #endif
     }
 
-    @_optimize(none)
-    internal consuming func consumeIOChannel() -> Channel {
-        let result = self.channel
-        // Transfer the ownership out and therefor
-        // don't perform close on deinit
+    internal func descriptor() -> Descriptor {
+        return self._descriptor
+    }
+
+    internal mutating func consumeDescriptor() -> Descriptor {
+        // This Descriptor has been consumed, we don't need to close it anymore
         self.closeWhenDone = false
-        return result
+        return self._descriptor
     }
 }
 
 #if canImport(WinSDK)
+import Synchronization
+
 internal enum PipeNameCounter {
     private static let value = Atomic<UInt64>(0)
 
@@ -988,15 +1146,17 @@ internal enum PipeNameCounter {
 }
 #endif
 
-internal struct CreatedPipe: ~Copyable {
+internal struct CreatedPipe: ~Copyable, Sendable {
     internal enum Purpose: CustomStringConvertible {
-        /// This pipe is used for standard input. This option maps to
-        /// `PIPE_ACCESS_OUTBOUND` on Windows where child only reads,
-        /// parent only writes.
+        /// This pipe is used for standard input.
+        ///
+        /// This option maps to `PIPE_ACCESS_OUTBOUND` on Windows where the subprocess only reads,
+        /// the caller only writes.
         case input
         /// This pipe is used for standard output and standard error.
+        ///
         /// This option maps to `PIPE_ACCESS_INBOUND` on Windows where
-        /// child only writes, parent only reads.
+        /// the subprocess only writes, the caller only reads.
         case output
 
         var description: String {
@@ -1043,7 +1203,7 @@ internal struct CreatedPipe: ~Copyable {
         /// > not supported by anonymous pipes.
         /// See https://learn.microsoft.com/en-us/windows/win32/ipc/anonymous-pipe-operations
         while true {
-            /// Windows named pipes are system wide. To avoid creating two pipes with the same
+            /// Windows named pipes are system-wide. To avoid creating two pipes with the same
             /// name, create the pipe with `FILE_FLAG_FIRST_PIPE_INSTANCE` such that it will
             /// return error `ERROR_ACCESS_DENIED` if we try to create another pipe with the same name.
             let pipeName = "\\\\.\\pipe\\LOCAL\\subprocess-\(GetCurrentProcessId())-\(purpose)-\(PipeNameCounter.nextValue())"
@@ -1056,7 +1216,7 @@ internal struct CreatedPipe: ~Copyable {
                 encodedAs: UTF16.self
             ) { pipeNameW in
                 // Use OVERLAPPED for async IO
-                var openMode: DWORD = DWORD(FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE)
+                var openMode: DWORD = DWORD(FILE_FLAG_OVERLAPPED) | DWORD(FILE_FLAG_FIRST_PIPE_INSTANCE)
                 switch purpose {
                 case .input:
                     openMode |= DWORD(PIPE_ACCESS_OUTBOUND)
@@ -1067,10 +1227,11 @@ internal struct CreatedPipe: ~Copyable {
                 return CreateNamedPipeW(
                     pipeNameW,
                     openMode,
-                    DWORD(PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS),
+                    DWORD(PIPE_TYPE_BYTE) | DWORD(PIPE_READMODE_BYTE) | DWORD(PIPE_WAIT) | DWORD(PIPE_REJECT_REMOTE_CLIENTS),
                     1, // Max instance,
-                    DWORD(readBufferSize),
-                    DWORD(readBufferSize),
+                    // Both libuv (Node) and Rust std::process use this value
+                    DWORD(64 * 1024),
+                    DWORD(64 * 1024),
                     0,
                     nil
                 )
@@ -1087,7 +1248,7 @@ internal struct CreatedPipe: ~Copyable {
                 // Throw all other errors
                 throw .asyncIOFailed(
                     reason: "CreateNamedPipeW failed",
-                    underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                    underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
                 )
             }
 
@@ -1108,14 +1269,14 @@ internal struct CreatedPipe: ~Copyable {
                     0,
                     &saAttributes,
                     DWORD(OPEN_EXISTING),
-                    DWORD(FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED),
+                    DWORD(FILE_ATTRIBUTE_NORMAL) | DWORD(FILE_FLAG_OVERLAPPED),
                     nil
                 )
             }
             guard let childEnd, childEnd != INVALID_HANDLE_VALUE else {
                 throw .asyncIOFailed(
                     reason: "CreateFileW failed",
-                    underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                    underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
                 )
             }
             switch purpose {
@@ -1130,7 +1291,7 @@ internal struct CreatedPipe: ~Copyable {
         }
         #else
         do {
-            let pipe = try FileDescriptor.pipe()
+            let pipe = try FileDescriptor.cloexecPipe()
             self._readFileDescriptor = .init(
                 pipe.readEnd,
                 closeWhenDone: closeWhenDone
@@ -1186,20 +1347,24 @@ extension Optional where Wrapped == String {
     }
 }
 
-/// Runs the body close, then runs the on-cleanup closure if the body closure throws an error
-/// or if the parent task is cancelled.
+/// Runs the body closure, then runs the on-cleanup closure if the body closure throws an error
+/// or if the calling task is cancelled.
 ///
 /// In the latter case, `onCleanup` may be run concurrently with `body`.
 /// The `body` closure is guaranteed to run exactly once.
 /// The `onCleanup` closure is guaranteed to run only once, or not at all.
-internal func withAsyncTaskCleanupHandler<Result: Sendable>(
+internal func withAsyncTaskCleanupHandler<Result: ~Copyable & Sendable>(
     _ body: () async throws -> Result,
     onCleanup handler: @Sendable @escaping () async -> Void,
 ) async throws -> Result {
     let (runCancellationHandlerStream, runCancellationHandlerContinuation) = AsyncThrowingStream.makeStream(of: Void.self)
-    return try await withThrowingTaskGroup(
+    // The body's result is moved out through this box rather than returned
+    // from the task group: a noncopyable `Result` can't be a `GroupResult`,
+    // which must be `Copyable`. The group itself returns `Void`.
+    var resultBox: Result? = nil
+    try await withThrowingTaskGroup(
         of: Void.self,
-        returning: Result.self
+        returning: Void.self
     ) { group in
         group.addTask {
             // Keep this task sleep indefinitely until the parent task is cancelled.
@@ -1234,14 +1399,14 @@ internal func withAsyncTaskCleanupHandler<Result: Sendable>(
         }
 
         do {
-            let result = try await body()
+            resultBox = try await body()
             runCancellationHandlerContinuation.finish()
-            return result
         } catch {
             runCancellationHandlerContinuation.finish(throwing: error)
             throw error
         }
     }
+    return resultBox.take()!
 }
 
 internal struct _OrderedSet<Element: Hashable & Sendable>: Hashable, Sendable {
@@ -1308,23 +1473,35 @@ extension HANDLE {
         else {
             throw .asyncIOFailed(
                 reason: "Failed to create pipe",
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
             )
         }
         guard let handle else {
             throw .asyncIOFailed(
                 reason: "Failed to create pipe",
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
             )
         }
         return handle
     }
+
+    /// Alias for `duplicate()`, for API symmetry with the POSIX
+    /// `FileDescriptor.safeDuplicate()`. Windows has no `dup3`/
+    /// `F_DUPFD_CLOEXEC` equivalent: handle inheritance is controlled
+    /// explicitly via the `STARTUPINFOEX` handle list passed at process
+    /// creation, not via a close-on-exec-style flag on the handle itself, so
+    /// there is nothing additional to opt into here.
+    func safeDuplicate() throws(SubprocessError) -> HANDLE {
+        try self.duplicate()
+    }
 }
 #endif
 
+/// Bridges untyped throws to typed subprocess errors.
+///
 /// Many standard library functions such as `withCheckedThrowingContinuation`
-/// does not support typed throw yet. This method casts `any Error` thrown by
-/// those methods back to `SubprocessError`
+/// do not support typed throws yet. This method casts `any Error` thrown by
+/// those methods back to `SubprocessError`.
 internal func _castError<Success: Sendable>(
     _ body: () async throws -> Success,
 ) async throws(SubprocessError) -> Success {

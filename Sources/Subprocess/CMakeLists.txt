@@ -18,11 +18,12 @@ add_library(Subprocess
   Result.swift
   IO/Output.swift
   IO/Input.swift
-  IO/AsyncIO+Dispatch.swift
+  IO/AsyncIO+KQueue.swift
   IO/AsyncIO+Linux.swift
   IO/AsyncIO+Windows.swift
+  IO/AsyncIO+Unix.swift
   Span+Subprocess.swift
-  AsyncBufferSequence.swift
+  SubprocessOutputSequence.swift
   API.swift
   SubprocessFoundation/Span+SubprocessFoundation.swift
   SubprocessFoundation/Output+Foundation.swift
@@ -34,29 +35,53 @@ if(WIN32)
 elseif(LINUX OR ANDROID)
   target_sources(Subprocess PRIVATE
     Platforms/Subprocess+Linux.swift
+    Platforms/Subprocess+Spawn.swift
     Platforms/Subprocess+Unix.swift)
 elseif(APPLE)
   target_sources(Subprocess PRIVATE
     Platforms/Subprocess+BSD.swift
     Platforms/Subprocess+Darwin.swift
+    Platforms/Subprocess+Spawn.swift
     Platforms/Subprocess+Unix.swift)
   target_compile_options(Subprocess PRIVATE
-    "$<$<COMPILE_LANGUAGE:Swift>:-DSUBPROCESS_ASYNCIO_DISPATCH>")
+    "$<$<COMPILE_LANGUAGE:Swift>:-DSUBPROCESS_ASYNCIO_KQUEUE>")
 elseif(FREEBSD OR OPENBSD)
   target_sources(Subprocess PRIVATE
     Platforms/Subprocess+BSD.swift
+    Platforms/Subprocess+Spawn.swift
     Platforms/Subprocess+Unix.swift)
   target_compile_options(Subprocess PRIVATE
-    "$<$<COMPILE_LANGUAGE:Swift>:-DSUBPROCESS_ASYNCIO_DISPATCH>")
+    "$<$<COMPILE_LANGUAGE:Swift>:-DSUBPROCESS_ASYNCIO_KQUEUE>")
 endif()
 
+# Keep in sync with the Subprocess target's swiftSettings in Package.swift.
+set_target_properties(Subprocess PROPERTIES
+  Swift_LANGUAGE_VERSION 6)
 target_compile_options(Subprocess PRIVATE
   "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-enable-experimental-feature StrictConcurrency>"
-  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-enable-experimental-feature Lifetimes>")
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-enable-experimental-feature Lifetimes>"
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-enable-upcoming-feature NonisolatedNonsendingByDefault>"
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-enable-upcoming-feature ExistentialAny>"
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-enable-upcoming-feature MemberImportVisibility>"
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-enable-upcoming-feature InternalImportsByDefault>")
+if(${PROJECT_NAME}_ENABLE_FOUNDATION)
+  # Equivalent of SwiftPM's (default) SubprocessFoundation trait.
+  target_compile_options(Subprocess PRIVATE
+    "$<$<COMPILE_LANGUAGE:Swift>:-DSubprocessFoundation>")
+  if(NOT APPLE AND TARGET FoundationEssentials)
+    target_link_libraries(Subprocess PUBLIC
+      FoundationEssentials)
+  endif()
+endif()
 target_link_libraries(Subprocess PUBLIC
   _SubprocessCShims)
-target_link_libraries(Subprocess PRIVATE
-  SwiftSystem::SystemPackage)
+if(NOT APPLE)
+  # SystemPackage types (FilePath, FileDescriptor, ...) are part of the public
+  # API on non-Apple platforms (`public import SystemPackage`), so clients need
+  # its module and link information. Apple platforms use the System framework.
+  target_link_libraries(Subprocess PUBLIC
+    SwiftSystem::SystemPackage)
+endif()
 
 install(TARGETS Subprocess
   EXPORT SwiftSubprocessTargets

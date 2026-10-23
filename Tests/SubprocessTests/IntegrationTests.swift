@@ -19,6 +19,8 @@ import SystemPackage
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Android)
+import Android
 #elseif canImport(Bionic)
 import Bionic
 #elseif canImport(Musl)
@@ -28,11 +30,16 @@ import WinSDK
 #endif
 
 import Testing
-import Dispatch
 import Foundation
 import TestResources
 import _SubprocessCShims
 @testable import Subprocess
+
+#if os(Android)
+let isAndroid = true
+#else
+let isAndroid = false
+#endif
 
 @Suite("Subprocess Integration (End to End) Tests", .serialized)
 struct SubprocessIntegrationTests {
@@ -66,15 +73,14 @@ extension SubprocessIntegrationTests {
         )
         #expect(result.terminationStatus.isSuccess)
         // https://github.com/swiftlang/swift/issues/77235
-        let output = result.standardOutput?
-            .trimmingNewLineAndQuotes()
+        let output = result.standardOutput.trimmingNewLineAndQuotes()
         // Windows echo includes quotes
         #expect(output == message)
     }
 
     @Test func testExecutableNamedCannotResolve() async throws {
         #if os(Windows)
-        let underlying = SubprocessError.WindowsError(rawValue: DWORD(ERROR_FILE_NOT_FOUND))
+        let underlying = SubprocessError.WindowsError(win32Error: DWORD(ERROR_FILE_NOT_FOUND))
         #else
         let underlying = Errno(rawValue: ENOENT)
         #endif
@@ -86,6 +92,39 @@ extension SubprocessIntegrationTests {
         await #expect(throws: expectedError) {
             _ = try await Subprocess.run(.name("do-not-exist"), output: .discarded)
         }
+    }
+
+    /// `name(_:)` takes a name to look up on `PATH`, so a value that names a
+    /// location instead is rejected rather than resolved against a current
+    /// directory. `/` is a path separator on every platform Subprocess supports.
+    @Test func testExecutableNameWithPathSeparatorIsRejected() async throws {
+        let error = await #expect(throws: SubprocessError.self) {
+            _ = try await Subprocess.run(.name("bin/do-not-exist"), output: .discarded)
+        }
+        #expect(error?.code == .spawnFailed)
+
+        let resolveError = await #expect(throws: SubprocessError.self) {
+            _ = try await Executable.name("bin/do-not-exist").resolveExecutablePath(in: .inherit)
+        }
+        #expect(resolveError?.code == .spawnFailed)
+    }
+
+    /// A `PATH` that is set but empty lists no directories, so a name resolves
+    /// to nothing rather than falling back to a built-in list of directories.
+    @Test func testExecutableNameWithEmptyPathValue() async throws {
+        #if os(Windows)
+        let name = "cmd.exe"
+        #else
+        let name = "echo"
+        #endif
+        let error = await #expect(throws: SubprocessError.self) {
+            _ = try await Subprocess.run(
+                .name(name),
+                environment: .custom(["PATH": ""]),
+                output: .discarded
+            )
+        }
+        #expect(error?.code == .executableNotFound)
     }
 
     @Test func testExecutableAtPath() async throws {
@@ -111,9 +150,7 @@ extension SubprocessIntegrationTests {
         )
         #expect(result.terminationStatus.isSuccess)
         // https://github.com/swiftlang/swift/issues/77235
-        let maybePath = result.standardOutput?
-            .trimmingNewLineAndQuotes()
-        let path = try #require(maybePath)
+        let path = result.standardOutput.trimmingNewLineAndQuotes()
         #expect(directory(path, isSameAs: expected))
     }
 
@@ -121,7 +158,7 @@ extension SubprocessIntegrationTests {
         #if os(Windows)
         let fakePath = FilePath("D:\\does\\not\\exist")
         let underlying = SubprocessError.WindowsError(
-            rawValue: DWORD(ERROR_FILE_NOT_FOUND)
+            win32Error: DWORD(ERROR_FILE_NOT_FOUND)
         )
         #else
         let fakePath = FilePath("/usr/bin/do-not-exist")
@@ -182,7 +219,7 @@ extension SubprocessIntegrationTests {
                 output: .string(limit: 8)
             )
             #expect(first.terminationStatus.isSuccess)
-            #expect(first.standardOutput?.trimmingNewLineAndQuotes() == "FIRST")
+            #expect(first.standardOutput.trimmingNewLineAndQuotes() == "FIRST")
 
             let second = try await Subprocess.run(
                 .name(executableName),
@@ -192,7 +229,7 @@ extension SubprocessIntegrationTests {
                 output: .string(limit: 8)
             )
             #expect(second.terminationStatus.isSuccess)
-            #expect(second.standardOutput?.trimmingNewLineAndQuotes() == "SECOND")
+            #expect(second.standardOutput.trimmingNewLineAndQuotes() == "SECOND")
         }
     }
     #endif
@@ -221,8 +258,7 @@ extension SubprocessIntegrationTests {
         )
         #expect(result.terminationStatus.isSuccess)
         // https://github.com/swiftlang/swift/issues/77235
-        let output = result.standardOutput?
-            .trimmingNewLineAndQuotes()
+        let output = result.standardOutput.trimmingNewLineAndQuotes()
         #expect(
             output == message
         )
@@ -254,8 +290,7 @@ extension SubprocessIntegrationTests {
         )
         #expect(result.terminationStatus.isSuccess)
         // https://github.com/swiftlang/swift/issues/77235
-        let output = result.standardOutput?
-            .trimmingNewLineAndQuotes()
+        let output = result.standardOutput.trimmingNewLineAndQuotes()
         #expect(
             output == "apple"
         )
@@ -276,7 +311,7 @@ extension SubprocessIntegrationTests {
         )
         #expect(result.terminationStatus.isSuccess)
         // https://github.com/swiftlang/swift/issues/77235
-        let output = result.standardOutput?
+        let output = result.standardOutput
             .trimmingCharacters(in: .whitespacesAndNewlines)
         #expect(
             output == "Data Content"
@@ -308,7 +343,7 @@ extension SubprocessIntegrationTests {
             error: .discarded
         )
         #expect(result.terminationStatus.isSuccess)
-        let pathValue = try #require(result.standardOutput)
+        let pathValue = result.standardOutput
         #if os(Windows)
         let expectedPathValue = ProcessInfo.processInfo.environment["Path"] ?? ProcessInfo.processInfo.environment["PATH"] ?? ProcessInfo.processInfo.environment["path"]
         let expected = try #require(expectedPathValue)
@@ -358,8 +393,7 @@ extension SubprocessIntegrationTests {
         )
         #expect(result.terminationStatus.isSuccess)
         // https://github.com/swiftlang/swift/issues/77235
-        let output = result.standardOutput?
-            .trimmingNewLineAndQuotes()
+        let output = result.standardOutput.trimmingNewLineAndQuotes()
         #expect(
             output == path
         )
@@ -406,8 +440,7 @@ extension SubprocessIntegrationTests {
         )
         #expect(result.terminationStatus.isSuccess)
         // https://github.com/swiftlang/swift/issues/77235
-        let output = result.standardOutput?
-            .trimmingNewLineAndQuotes()
+        let output = result.standardOutput.trimmingNewLineAndQuotes()
         #expect(output == "value")
 
         // Now make sure we can remove `SubprocessTest`
@@ -434,7 +467,7 @@ extension SubprocessIntegrationTests {
         )
         // The new echo/printenv should not find `SubprocessTest`
         #if os(Windows)
-        #expect(result2.standardOutput?.trimmingNewLineAndQuotes() == "%SubprocessTest%")
+        #expect(result2.standardOutput.trimmingNewLineAndQuotes() == "%SubprocessTest%")
         #else
         #expect(result2.terminationStatus == .exited(1))
         #endif
@@ -472,9 +505,7 @@ extension SubprocessIntegrationTests {
             error: .discarded
         )
         #expect(result.terminationStatus.isSuccess)
-        let output = try #require(
-            result.standardOutput
-        ).trimmingNewLineAndQuotes()
+        let output = result.standardOutput.trimmingNewLineAndQuotes()
         #if os(Windows)
         // Make sure the newly launched process does
         // NOT have `SystemRoot` in environment
@@ -522,8 +553,7 @@ extension SubprocessIntegrationTests {
             error: .discarded
         )
         #expect(result.terminationStatus.isSuccess)
-        let output = result.standardOutput?
-            .trimmingNewLineAndQuotes()
+        let output = result.standardOutput.trimmingNewLineAndQuotes()
         #expect(
             output == customPath
         )
@@ -562,7 +592,7 @@ extension SubprocessIntegrationTests {
             error: .discarded
         )
         #if os(Windows)
-        #expect(result.standardOutput?.trimmingNewLineAndQuotes() == "%REMOVEME%")
+        #expect(result.standardOutput.trimmingNewLineAndQuotes() == "%REMOVEME%")
         #else
         #expect(result.terminationStatus == .exited(1))
         #endif
@@ -587,8 +617,7 @@ extension SubprocessIntegrationTests {
             error: .discarded
         )
         #expect(result.terminationStatus.isSuccess)
-        let output = result.standardOutput?
-            .trimmingNewLineAndQuotes()
+        let output = result.standardOutput.trimmingNewLineAndQuotes()
         #expect(
             output == customValue
         )
@@ -619,12 +648,13 @@ extension SubprocessIntegrationTests {
         // PATH="$PATH:$HOME/Desktop/.DS_Store"
         // posix_spawn returns ENOTDIR in this case because `.DS_Store` is a valid
         // file, but not a directory so it can't append the executable name.
+        // Such an entry must be skipped, letting a later entry win.
         let setup = TestSetup(
             executable: .name("echo"),
             arguments: ["testEnvironmentPathWithNonDirectoryPaths"],
             environment: .inherit.updating([
                 // /bin/ls is a valid file, but not directory
-                "PATH": "/bin/ls"
+                "PATH": "/bin/ls:/bin"
             ])
         )
 
@@ -635,7 +665,7 @@ extension SubprocessIntegrationTests {
             error: .discarded
         )
         #expect(result.terminationStatus.isSuccess)
-        #expect(result.standardOutput?.trimmingNewLineAndQuotes() == "testEnvironmentPathWithNonDirectoryPaths")
+        #expect(result.standardOutput.trimmingNewLineAndQuotes() == "testEnvironmentPathWithNonDirectoryPaths")
     }
     #endif
 }
@@ -668,9 +698,7 @@ extension SubprocessIntegrationTests {
         // There shouldn't be any other environment variables besides
         // `PATH` that we set
         // https://github.com/swiftlang/swift/issues/77235
-        let output = result.standardOutput?
-            .trimmingNewLineAndQuotes()
-        let path = try #require(output)
+        let path = result.standardOutput.trimmingNewLineAndQuotes()
         #expect(directory(path, isSameAs: workingDirectory))
     }
 
@@ -701,8 +729,7 @@ extension SubprocessIntegrationTests {
         #expect(result.terminationStatus.isSuccess)
         // There shouldn't be any other environment variables besides
         // `PATH` that we set
-        let resultPath = try #require(result.standardOutput)
-            .trimmingNewLineAndQuotes()
+        let resultPath = result.standardOutput.trimmingNewLineAndQuotes()
         #if canImport(Darwin)
         // On Darwin, /var is linked to /private/var; /tmp is linked to /private/tmp
         var expected = workingDirectory
@@ -727,7 +754,7 @@ extension SubprocessIntegrationTests {
             arguments: ["/c", "cd"],
             workingDirectory: invalidPath
         )
-        let underlying = SubprocessError.WindowsError(rawValue: DWORD(ERROR_DIRECTORY))
+        let underlying = SubprocessError.WindowsError(win32Error: DWORD(ERROR_DIRECTORY))
         let expectedError: SubprocessError = .failedToChangeWorkingDirectory(
             #"X:\Does\Not\Exist"#, underlyingError: underlying
         )
@@ -748,6 +775,169 @@ extension SubprocessIntegrationTests {
             _ = try await _run(setup, input: .none, output: .string(limit: .max), error: .discarded)
         }
     }
+
+    #if !os(Windows)
+    /// A path that exists but is not a directory is reported as `ENOTDIR`, not as
+    /// a missing executable.
+    ///
+    /// Both working-directory validation routes have to reach this conclusion:
+    /// the `O_SEARCH`/`O_PATH` open fails with `ENOTDIR` because both imply
+    /// `O_DIRECTORY`, and the `stat` route has to check the file type explicitly
+    /// because `access(X_OK)` succeeds on an executable regular file.
+    @Test func testWorkingDirectoryIsNotADirectory() async throws {
+        let notADirectory = "/bin/sh"
+        let expectedError: SubprocessError = .failedToChangeWorkingDirectory(
+            notADirectory,
+            underlyingError: Errno(rawValue: ENOTDIR)
+        )
+        await #expect(throws: expectedError) {
+            _ = try await _run(
+                TestSetup(
+                    executable: .path("/bin/pwd"),
+                    arguments: [],
+                    workingDirectory: FilePath(notADirectory)
+                ),
+                input: .none,
+                output: .string(limit: .max),
+                error: .discarded
+            )
+        }
+    }
+
+    /// `chdir` needs only execute (search) permission on a directory, so a
+    /// directory this process may search but not read must still be usable as a
+    /// working directory.
+    ///
+    /// This guards the descriptor the `fchdir` file action is built from: opening
+    /// it `O_RDONLY` would reject such a directory, which is why the shim asks
+    /// for `O_SEARCH`/`O_PATH` instead.
+    @Test(
+        .enabled(
+            if: geteuid() != 0,
+            "root bypasses directory permission checks, so this would pass vacuously"
+        )
+    )
+    func testWorkingDirectoryWithExecuteOnlyPermission() async throws {
+        let directoryPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("subprocess-execute-only-\(randomString(length: 12, lettersOnly: true))")
+            ._fileSystemPath
+        try FileManager.default.createDirectory(
+            atPath: directoryPath,
+            withIntermediateDirectories: true
+        )
+        defer {
+            // Restore read permission first: the directory cannot be removed
+            // while its contents are unreadable.
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directoryPath
+            )
+            try? FileManager.default.removeItem(atPath: directoryPath)
+        }
+        // Searchable, but not readable.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o111],
+            ofItemAtPath: directoryPath
+        )
+        // Confirm the premise: an O_RDONLY open of this directory is refused,
+        // so a passing test really does exercise the execute-only case. The
+        // descriptor and `errno` are captured together, since #expect may run
+        // code that clobbers `errno` between the two.
+        let (readOnlyDescriptor, readOnlyError) = directoryPath.withCString {
+            (path) -> (CInt, CInt) in
+            let descriptor = open(path, O_RDONLY | O_DIRECTORY)
+            return (descriptor, descriptor == -1 ? errno : 0)
+        }
+        if readOnlyDescriptor != -1 {
+            close(readOnlyDescriptor)
+        }
+        #expect(readOnlyDescriptor == -1)
+        #expect(readOnlyError == EACCES)
+
+        let workingDirectory = FilePath(directoryPath)
+        let result = try await _run(
+            TestSetup(
+                executable: .path("/bin/pwd"),
+                arguments: [],
+                workingDirectory: workingDirectory
+            ),
+            input: .none,
+            output: .string(limit: .max),
+            error: .discarded
+        )
+        #expect(result.terminationStatus.isSuccess)
+        let resultPath = result.standardOutput.trimmingNewLineAndQuotes()
+        #if canImport(Darwin)
+        // On Darwin, /var is linked to /private/var; /tmp is linked to /private/tmp
+        var expected = workingDirectory
+        if expected.starts(with: "/var") || expected.starts(with: "/tmp") {
+            expected = FilePath("/private").appending(expected.components)
+        }
+        #expect(FilePath(resultPath) == expected)
+        #else
+        #expect(FilePath(resultPath) == workingDirectory)
+        #endif
+    }
+
+    /// A directory the process cannot search at all is reported as `EACCES`, not
+    /// as a missing executable.
+    ///
+    /// This is the counterpart to
+    /// ``testWorkingDirectoryWithExecuteOnlyPermission()``: that one proves the
+    /// check is not too strict, this one proves it is not too lax. Only a real
+    /// `O_SEARCH` (Darwin, FreeBSD) rejects such a directory on open; where the
+    /// flags fall back to `O_PATH` the kernel checks no permission on the target,
+    /// so the open succeeds and only an explicit searchability check catches it.
+    /// Without that check the `fchdir` file action fails `EACCES` in the child,
+    /// and because `EACCES` is a try-the-next-candidate errno the caller would be
+    /// told the executable does not exist.
+    @Test(
+        .enabled(
+            if: geteuid() != 0,
+            "root bypasses directory permission checks, so this would pass vacuously"
+        )
+    )
+    func testWorkingDirectoryWithoutSearchPermission() async throws {
+        let directoryPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("subprocess-unsearchable-\(randomString(length: 12, lettersOnly: true))")
+            ._fileSystemPath
+        try FileManager.default.createDirectory(
+            atPath: directoryPath,
+            withIntermediateDirectories: true
+        )
+        defer {
+            // Restore permissions first: the directory cannot be removed while it
+            // cannot be searched.
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directoryPath
+            )
+            try? FileManager.default.removeItem(atPath: directoryPath)
+        }
+        // Neither readable nor searchable.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000],
+            ofItemAtPath: directoryPath
+        )
+
+        let expectedError: SubprocessError = .failedToChangeWorkingDirectory(
+            directoryPath,
+            underlyingError: Errno(rawValue: EACCES)
+        )
+        await #expect(throws: expectedError) {
+            _ = try await _run(
+                TestSetup(
+                    executable: .path("/bin/pwd"),
+                    arguments: [],
+                    workingDirectory: FilePath(directoryPath)
+                ),
+                input: .none,
+                output: .string(limit: .max),
+                error: .discarded
+            )
+        }
+    }
+    #endif // !os(Windows)
 }
 
 // MARK: - Input Tests
@@ -800,7 +990,7 @@ extension SubprocessIntegrationTests {
         #expect(catResult.terminationStatus.isSuccess)
         // Output should match the input content
         #expect(
-            catResult.standardOutput?.trimmingNewLineAndQuotes() == content
+            catResult.standardOutput.trimmingNewLineAndQuotes() == content
         )
     }
 
@@ -826,7 +1016,7 @@ extension SubprocessIntegrationTests {
         #expect(catResult.terminationStatus.isSuccess)
         // Output should match the input content
         #expect(
-            catResult.standardOutput?.trimmingNewLineAndQuotes() == content.trimmingNewLineAndQuotes()
+            catResult.standardOutput.trimmingNewLineAndQuotes() == content.trimmingNewLineAndQuotes()
         )
     }
 
@@ -916,6 +1106,8 @@ extension SubprocessIntegrationTests {
         let expected: Data = try Data(
             contentsOf: URL(filePath: theMysteriousIsland.string)
         )
+        // TODO: Pass `expected.span` directly to `_run()`.
+        // https://github.com/swiftlang/swift/issues/90259
         let ptr = expected.withUnsafeBytes { return $0 }
         let span: Span<UInt8> = Span(_unsafeBytes: ptr)
         let catResult = try await _run(
@@ -951,7 +1143,7 @@ extension SubprocessIntegrationTests {
             contentsOf: URL(filePath: theMysteriousIsland.string)
         )
         let stream: AsyncStream<Data> = AsyncStream { continuation in
-            DispatchQueue.global().async {
+            Task<Void, Never>.detached {
                 var currentStart = 0
                 while currentStart + chunkSize < expected.count {
                     continuation.yield(expected[currentStart..<currentStart + chunkSize])
@@ -994,24 +1186,26 @@ extension SubprocessIntegrationTests {
         )
         let result = try await _run(
             setup,
+            input: .inputWriter,
+            output: .sequence,
             error: .discarded
-        ) { execution, standardInputWriter, standardOutput in
+        ) { execution in
             async let buffer = {
                 var _buffer = Data()
-                for try await chunk in standardOutput {
+                for try await chunk in execution.standardOutput {
                     let currentChunk = chunk.withUnsafeBytes { Data($0) }
                     _buffer += currentChunk
                 }
                 return _buffer
             }()
 
-            _ = try await standardInputWriter.write(Array(expected))
-            try await standardInputWriter.finish()
+            _ = try await execution.standardInputWriter.write(Array(expected))
+            try await execution.standardInputWriter.finish()
 
             return try await buffer
         }
         #expect(result.terminationStatus.isSuccess)
-        #expect(result.value == expected)
+        #expect(result.closureResult == expected)
     }
 
     @Test func testNoInputTriggersEOF() async throws {
@@ -1052,11 +1246,48 @@ extension SubprocessIntegrationTests {
             error: .string(limit: .max)
         )
         #expect(result.terminationStatus.isSuccess)
-        #expect(result.standardOutput?.trimmingNewLineAndQuotes().isEmpty == true)
+        #expect(result.standardOutput.trimmingNewLineAndQuotes().isEmpty == true)
         #if !os(Windows)
         // cmd.exe emits an error
-        #expect(result.standardError?.trimmingNewLineAndQuotes().isEmpty == true)
+        #expect(result.standardError.trimmingNewLineAndQuotes().isEmpty == true)
         #endif
+    }
+}
+
+// MARK: - Standard Input Writer Lifetime Tests
+
+extension SubprocessIntegrationTests {
+    @Test func testStandardInputWriterRejectsWritesAfterFinish() async throws {
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "findstr x*"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/cat"),
+            arguments: []
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .inputWriter,
+            output: .string(limit: 1024),
+            error: .discarded
+        ) { execution in
+            let writer = execution.standardInputWriter
+            _ = try await writer.write("Hello, world!\n")
+            try await writer.finish()
+            // Writing after finish() must throw, not silently no-op or crash.
+            let afterFinishError = await #expect(throws: SubprocessError.self) {
+                _ = try await writer.write("after finish")
+            }
+            #expect(afterFinishError?.code == .failedToWriteToSubprocess)
+            // finish() is idempotent.
+            try await writer.finish()
+        }
+        #expect(result.terminationStatus.isSuccess)
+        #expect(result.standardOutput.contains("Hello, world!"))
     }
 }
 
@@ -1109,9 +1340,7 @@ extension SubprocessIntegrationTests {
             output: .string(limit: 2048 * 1024, encoding: UTF8.self),
             error: .discarded
         )
-        let output = try #require(
-            catResult.standardOutput?.trimmingNewLineAndQuotes()
-        )
+        let output = catResult.standardOutput.trimmingNewLineAndQuotes()
         #expect(
             output
                 == String(
@@ -1380,9 +1609,7 @@ extension SubprocessIntegrationTests {
             output: .discarded,
             error: .string(limit: 2048 * 1024, encoding: UTF8.self)
         )
-        let output = try #require(
-            catResult.standardError?.trimmingNewLineAndQuotes()
-        )
+        let output = catResult.standardError.trimmingNewLineAndQuotes()
         #expect(
             output
                 == String(
@@ -1690,24 +1917,26 @@ extension SubprocessIntegrationTests {
         )
         let result = try await _run(
             setup,
-            output: .discarded
-        ) { execution, standardInputWriter, standardError in
+            input: .inputWriter,
+            output: .discarded,
+            error: .sequence
+        ) { execution in
             async let buffer = {
                 var _buffer = Data()
-                for try await chunk in standardError {
+                for try await chunk in execution.standardError {
                     let currentChunk = chunk.withUnsafeBytes { Data($0) }
                     _buffer += currentChunk
                 }
                 return _buffer
             }()
 
-            _ = try await standardInputWriter.write(Array(expected))
-            try await standardInputWriter.finish()
+            _ = try await execution.standardInputWriter.write(Array(expected))
+            try await execution.standardInputWriter.finish()
 
             return try await buffer
         }
         #expect(result.terminationStatus.isSuccess)
-        #expect(result.value == expected)
+        #expect(result.closureResult == expected)
     }
 
     @Test func stressTestWithLittleOutput() async throws {
@@ -1731,8 +1960,8 @@ extension SubprocessIntegrationTests {
                 error: .string(limit: 4)
             )
             #expect(result.terminationStatus.isSuccess)
-            #expect(result.standardOutput?.trimmingNewLineAndQuotes() == "x")
-            #expect(result.standardError?.trimmingNewLineAndQuotes() == "y")
+            #expect(result.standardOutput.trimmingNewLineAndQuotes() == "x")
+            #expect(result.standardError.trimmingNewLineAndQuotes() == "y")
         }
     }
 
@@ -1757,8 +1986,8 @@ extension SubprocessIntegrationTests {
                 error: .string(limit: 4)
             )
             #expect(result.terminationStatus.isSuccess)
-            #expect(result.standardOutput?.trimmingNewLineAndQuotes() == "x")
-            #expect(result.standardError?.trimmingNewLineAndQuotes() == "y")
+            #expect(result.standardOutput.trimmingNewLineAndQuotes() == "x")
+            #expect(result.standardError.trimmingNewLineAndQuotes() == "y")
         }
     }
 
@@ -1810,6 +2039,34 @@ extension SubprocessIntegrationTests {
         #expect(result.terminationStatus.isSuccess)
     }
 
+    #if !os(Windows)
+    @Test func stressTestCapturingLargeStandardError() async throws {
+        // Regression test for swiftlang/swift-subprocess#34.
+        // A child blocked writing to a full stderr pipe while the parent
+        // captured stderr unbounded, with stdout discarded and no input. The
+        // hang was specific to the Unix capture path, so there's no Windows
+        // variant (`testStringErrorOutput()` covers Windows large-stderr
+        // capture). The volume exceeds the pipe buffer so the child actually
+        // blocks on write if the capture ever stops draining, and the exact
+        // byte count guards against a truncated capture.
+        let lineCount = 16_384
+        let lineWidth = 64 // 63 payload bytes + newline; 1 MiB total
+        let payload = String(repeating: "x", count: lineWidth - 1)
+        let setup = TestSetup(
+            executable: .path("/bin/sh"),
+            arguments: ["-c", "yes '\(payload)' | head -n \(lineCount) 1>&2"]
+        )
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .discarded,
+            error: .string(limit: .max)
+        )
+        #expect(result.terminationStatus.isSuccess)
+        #expect(result.standardError.utf8.count == lineCount * lineWidth)
+    }
+    #endif
+
     @Test func testCaptureEmptyOutputError() async throws {
         #if os(Windows)
         let setup = TestSetup(
@@ -1829,8 +2086,8 @@ extension SubprocessIntegrationTests {
             error: .string(limit: .max)
         )
         #expect(result.terminationStatus.isSuccess)
-        #expect(result.standardOutput?.trimmingNewLineAndQuotes() == "")
-        #expect(result.standardError?.trimmingNewLineAndQuotes() == "")
+        #expect(result.standardOutput.trimmingNewLineAndQuotes() == "")
+        #expect(result.standardError.trimmingNewLineAndQuotes() == "")
     }
 
     @Test func testCustomStreamingBufferSize() async throws {
@@ -1863,10 +2120,10 @@ extension SubprocessIntegrationTests {
         _ = try await _run(
             setup,
             input: .none,
+            output: .sequence,
             error: .discarded,
-            preferredBufferSize: 1
-        ) { execution, standardOutput in
-            for try await line in standardOutput.strings() {
+        ) { execution in
+            for try await line in execution.standardOutput.strings() {
                 // If we use default buffer size this test will hang
                 // because Subprocess is stuck on waiting 16k worth of
                 // output when there are only 3.
@@ -1900,7 +2157,7 @@ extension SubprocessIntegrationTests {
             error: .combinedWithOutput
         )
         #expect(result.terminationStatus.isSuccess)
-        let output = try #require(result.standardOutput)
+        let output = result.standardOutput
         #expect(output.contains("Hello Stdout"))
         #expect(output.contains("Hello Stderr"))
     }
@@ -2032,10 +2289,11 @@ extension SubprocessIntegrationTests {
         _ = try await _run(
             setup,
             input: .none,
+            output: .sequence,
             error: .combinedWithOutput
-        ) { execution, standardOutput in
+        ) { execution in
             var output: String = ""
-            for try await line in standardOutput.strings() {
+            for try await line in execution.standardOutput.strings() {
                 output += line
             }
             #expect(output.contains("Hello Stdout"))
@@ -2058,12 +2316,14 @@ extension SubprocessIntegrationTests {
 
         _ = try await _run(
             setup,
-            input: .none
-        ) { execution, standardOutput, standardError in
+            input: .none,
+            output: .sequence,
+            error: .sequence
+        ) { execution in
             try await withThrowingTaskGroup { group in
                 group.addTask {
                     var stdout: String = ""
-                    for try await line in standardOutput.strings() {
+                    for try await line in execution.standardOutput.strings() {
                         stdout += line
                     }
                     #expect(stdout.contains("Hello Stdout"))
@@ -2071,7 +2331,7 @@ extension SubprocessIntegrationTests {
 
                 group.addTask {
                     var stderr: String = ""
-                    for try await line in standardError.strings() {
+                    for try await line in execution.standardError.strings() {
                         stderr += line
                     }
                     #expect(stderr.contains("Hello Stderr"))
@@ -2083,6 +2343,635 @@ extension SubprocessIntegrationTests {
     }
 }
 
+// MARK: - Unified run() Tests
+extension SubprocessIntegrationTests {
+    @Test func testBodyClosureReturnValue() async throws {
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "echo hello"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/echo"),
+            arguments: ["hello"]
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .discarded,
+            error: .discarded
+        ) { _ in
+            return 42
+        }
+        #expect(result.terminationStatus.isSuccess)
+        #expect(result.closureResult == 42)
+    }
+
+    @Test func testBodyClosureReturnsNoncopyableValue() async throws {
+        // A move-only value returned from the body closure: this only compiles
+        // if `run`'s `Result` (and `ExecutionResult.closureResult`) is `~Copyable`.
+        struct MoveOnlyToken: ~Copyable, Sendable {
+            let value: Int
+        }
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "echo hello"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/echo"),
+            arguments: ["hello"]
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .discarded,
+            error: .discarded
+        ) { _ in
+            return MoveOnlyToken(value: 42)
+        }
+        // `result` is itself noncopyable (its ClosureResult is). Read the
+        // copyable field first, then move the token out via the consuming
+        // accessor (a non-`@frozen` type can't be partially consumed across
+        // module boundaries).
+        #expect(result.terminationStatus.isSuccess)
+        let token = result.takeClosureResult()
+        #expect(token.value == 42)
+    }
+
+    @Test func testBodyClosureReturnValueWithCapturedOutput() async throws {
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "echo hello"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/echo"),
+            arguments: ["hello"]
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .string(limit: 64),
+            error: .discarded
+        ) { _ in
+            return "closure-value"
+        }
+        #expect(result.terminationStatus.isSuccess)
+        #expect(result.closureResult == "closure-value")
+        let output = result.standardOutput
+        #expect(output.contains("hello"))
+    }
+
+    @Test func testBodyClosureThrows() async throws {
+        struct BodyError: Error, Equatable {}
+
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "echo hello"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/echo"),
+            arguments: ["hello"]
+        )
+        #endif
+        await #expect(throws: BodyError.self) {
+            let _: ExecutionResult<Void, DiscardedOutput, DiscardedOutput> = try await _run(
+                setup,
+                input: .none,
+                output: .discarded,
+                error: .discarded
+            ) { _ in
+                throw BodyError()
+            }
+        }
+    }
+
+    @Test func testBodyClosureThrowsWithInputWriter() async throws {
+        // Regression test for the CustomWriteInput hang fix: when the body
+        // throws, run() must still finish() the input writer so the child
+        // process sees EOF on stdin and terminates. Otherwise this test hangs.
+        struct BodyError: Error, Equatable {}
+
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "findstr x*"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/cat"),
+            arguments: []
+        )
+        #endif
+        await #expect(throws: BodyError.self) {
+            let _: ExecutionResult<Void, DiscardedOutput, DiscardedOutput> = try await _run(
+                setup,
+                input: .inputWriter,
+                output: .discarded,
+                error: .discarded
+            ) { _ in
+                throw BodyError()
+            }
+        }
+    }
+
+    @Test func testStreamingOutputWithCapturedError() async throws {
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "echo Hello Stdout & echo Hello Stderr 1>&2"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/sh"),
+            arguments: ["-c", "echo Hello Stdout; echo Hello Stderr 1>&2"]
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .sequence,
+            error: .string(limit: 64)
+        ) { execution in
+            var collected = ""
+            for try await line in execution.standardOutput.strings() {
+                collected += line
+            }
+            return collected
+        }
+        #expect(result.terminationStatus.isSuccess)
+        #expect(result.closureResult.contains("Hello Stdout"))
+        let stderr = result.standardError
+        #expect(stderr.contains("Hello Stderr"))
+    }
+
+    @Test func testStreamingErrorWithCapturedOutput() async throws {
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "echo Hello Stdout & echo Hello Stderr 1>&2"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/sh"),
+            arguments: ["-c", "echo Hello Stdout; echo Hello Stderr 1>&2"]
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .string(limit: 64),
+            error: .sequence
+        ) { execution in
+            var collected = ""
+            for try await line in execution.standardError.strings() {
+                collected += line
+            }
+            return collected
+        }
+        #expect(result.terminationStatus.isSuccess)
+        #expect(result.closureResult.contains("Hello Stderr"))
+        let stdout = result.standardOutput
+        #expect(stdout.contains("Hello Stdout"))
+    }
+
+    @Test func testInputWriterWithoutExplicitFinish() async throws {
+        // Verifies that run() finishes the input writer after the body returns
+        // when the caller forgot to. Without this, the child never sees EOF on
+        // stdin and this test hangs.
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "findstr x*"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/cat"),
+            arguments: []
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .inputWriter,
+            output: .string(limit: 64),
+            error: .discarded
+        ) { execution in
+            _ = try await execution.standardInputWriter.write("hello\n")
+            // Intentionally don't call finish(); run() should do it.
+        }
+        #expect(result.terminationStatus.isSuccess)
+        let output = result.standardOutput
+        #expect(output.contains("hello"))
+    }
+}
+
+// MARK: - Cancellable IO Tests
+
+// Regression tests for https://github.com/swiftlang/swift-subprocess/issues/256.
+// Ensure Subprocess cancels IO when the child process exits
+
+#if !os(Windows)
+extension SubprocessIntegrationTests {
+    @Test func testWeDoNotHangIfStandardInputRemainsOpenButProcessExits() async throws {
+        // The shell forks a `sleep` grandchild that inherits stdin, then
+        // the main shell reads one line and exits. The parent has 16 MB
+        // queued for stdin which the grandchild never reads; the write
+        // loop is therefore blocked on a full pipe with no reader making
+        // forward progress.
+        //
+        // The subshell trick — duplicating stdin into fd 2 in the parent
+        // shell, then mapping fd 2 back onto fd 0 in the subshell — is
+        // necessary because POSIX requires backgrounded processes (`&`)
+        // to have their stdin redirected to `/dev/null` unless explicitly
+        // overridden. Without this dance, dash and other strict shells
+        // would hand the grandchild `/dev/null` instead of the real stdin
+        // pipe.
+        let script = """
+            exec 2>&-
+            exec 2<&0
+            ( exec 0<&2; exec 2>&-; exec sleep 12345678 ) &
+            exec 2>&-
+            read -r line
+            echo "$line"
+            echo "$!"
+            exec >&-
+            exit 0
+            """
+        let setup = TestSetup(
+            executable: .path("/bin/sh"),
+            arguments: ["-c", script]
+        )
+
+        var sleepPidToKill: pid_t = 0
+        defer {
+            if sleepPidToKill != 0 {
+                kill(sleepPidToKill, SIGKILL)
+            }
+        }
+
+        // "GO\n" plus 16 MB of filler. The first chunk is small enough to fit
+        // in the pipe buffer; the filler is what wedges the writer.
+        var input: [UInt8] = []
+        input.append(contentsOf: "GO\n".utf8)
+        input.append(contentsOf: Array(repeating: UInt8(0x42), count: 16 * 1024 * 1024))
+
+        let result = try await _run(
+            setup,
+            input: .array(input),
+            output: .sequence,
+            error: .discarded
+        ) { execution in
+            var iterator = execution.standardOutput.strings().makeAsyncIterator()
+            #expect(try await iterator.next() == "GO")
+            let pidLine = try await iterator.next()
+            return pidLine.flatMap { pid_t($0) } ?? 0
+        }
+
+        sleepPidToKill = result.closureResult
+        #expect(sleepPidToKill != 0)
+        #expect(result.terminationStatus == .exited(0))
+    }
+
+    @Test func testWeDoNotHangIfStandardOutputRemainsOpenButProcessExits() async throws {
+        // The shell forks a `sleep` grandchild that inherits stdout. Stdin
+        // and stderr are diverted to `/dev/null` so the grandchild only
+        // holds stdout open. The main shell prints to both streams and
+        // exits; the grandchild keeps the parent's stdout read end from
+        // reaching EOF.
+        //
+        // The PID is sent on stderr so the call can capture it via
+        // `.sequence`, while `.string(limit:)` is the mechanism that
+        // would hang on stdout.
+        let script = """
+            ( exec sleep 12345678 ) </dev/null 2>/dev/null &
+            echo "$!" >&2
+            echo "GO"
+            exit 0
+            """
+        let setup = TestSetup(
+            executable: .path("/bin/sh"),
+            arguments: ["-c", script]
+        )
+
+        var sleepPidToKill: pid_t = 0
+        defer {
+            if sleepPidToKill != 0 {
+                kill(sleepPidToKill, SIGKILL)
+            }
+        }
+
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .string(limit: 1024),
+            error: .sequence
+        ) { execution in
+            var capturedPid: pid_t = 0
+            for try await line in execution.standardError.strings() {
+                if let pid = pid_t(line) {
+                    capturedPid = pid
+                }
+            }
+            return capturedPid
+        }
+
+        sleepPidToKill = result.closureResult
+        #expect(sleepPidToKill != 0)
+        #expect(result.terminationStatus == .exited(0))
+        #expect(result.standardOutput.contains("GO"))
+    }
+
+    @Test func testWeDoNotHangIfStandardErrorRemainsOpenButProcessExits() async throws {
+        // Mirror of the stdout test: the grandchild only inherits stderr,
+        // and `.string(limit:)` on stderr blocks waiting for an EOF that
+        // never arrives.
+        let script = """
+            ( exec sleep 12345678 ) </dev/null >/dev/null &
+            echo "$!"
+            echo "GO" >&2
+            exit 0
+            """
+        let setup = TestSetup(
+            executable: .path("/bin/sh"),
+            arguments: ["-c", script]
+        )
+
+        var sleepPidToKill: pid_t = 0
+        defer {
+            if sleepPidToKill != 0 {
+                kill(sleepPidToKill, SIGKILL)
+            }
+        }
+
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .sequence,
+            error: .string(limit: 1024)
+        ) { execution in
+            var capturedPid: pid_t = 0
+            for try await line in execution.standardOutput.strings() {
+                if let pid = pid_t(line) {
+                    capturedPid = pid
+                }
+            }
+            return capturedPid
+        }
+
+        sleepPidToKill = result.closureResult
+        #expect(sleepPidToKill != 0)
+        #expect(result.terminationStatus == .exited(0))
+        #expect(result.standardError.contains("GO"))
+    }
+}
+#else
+extension SubprocessIntegrationTests {
+    // PowerShell snippet that spawns a long-sleeping grandchild via
+    // `Start-Process -NoNewWindow -PassThru`. The `-NoNewWindow` switch
+    // routes through .NET's `Process.Start` with `UseShellExecute=false`,
+    // which always passes `bInheritHandles=TRUE` and copies PowerShell's
+    // own std handles into `STARTUPINFO.hStd*`. The grandchild therefore
+    // inherits the pipe handles Subprocess set up for PowerShell, and
+    // those pipes stay open after PowerShell exits — the Win32 analog of
+    // the POSIX `fork` and `exec` dance the Unix tests use.
+    private static let spawnGrandchildSleep = """
+        $proc = Start-Process -NoNewWindow -FilePath powershell.exe `
+            -ArgumentList '-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 12345678' `
+            -PassThru
+        """
+
+    private static func killGrandchild(_ pid: DWORD) {
+        guard pid != 0 else { return }
+        guard let handle = OpenProcess(DWORD(PROCESS_TERMINATE), false, pid) else {
+            return
+        }
+        _ = TerminateProcess(handle, 1)
+        CloseHandle(handle)
+    }
+
+    @Test func testWeDoNotHangIfStandardInputRemainsOpenButProcessExits() async throws {
+        // PowerShell forks the sleeping grandchild (which inherits stdin),
+        // reads one line, echoes the line plus the grandchild PID, then
+        // exits. The parent has 16 MB queued for stdin which the grandchild
+        // never reads; the write loop is therefore blocked on a full pipe
+        // buffer with no reader making forward progress.
+        let script = """
+            $ErrorActionPreference = 'Stop'
+            \(Self.spawnGrandchildSleep)
+            $line = [Console]::In.ReadLine()
+            Write-Output $line
+            Write-Output $proc.Id
+            exit 0
+            """
+        let setup = TestSetup(
+            executable: .name("powershell.exe"),
+            arguments: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]
+        )
+
+        var grandchildPidToKill: DWORD = 0
+        defer { Self.killGrandchild(grandchildPidToKill) }
+
+        // "GO\r\n" plus 16 MB of filler. The first chunk is small enough to
+        // fit in the pipe buffer; the filler is what wedges the writer.
+        var input: [UInt8] = []
+        input.append(contentsOf: "GO\r\n".utf8)
+        input.append(contentsOf: Array(repeating: UInt8(0x42), count: 16 * 1024 * 1024))
+
+        let result = try await _run(
+            setup,
+            input: .array(input),
+            output: .sequence,
+            error: .discarded
+        ) { execution in
+            var iterator = execution.standardOutput.strings().makeAsyncIterator()
+            #expect(try await iterator.next() == "GO")
+            let pidLine = try await iterator.next()
+            return pidLine.flatMap { DWORD($0) } ?? 0
+        }
+
+        grandchildPidToKill = result.closureResult
+        #expect(grandchildPidToKill != 0)
+        #expect(result.terminationStatus == .exited(0))
+    }
+
+    @Test func testWeDoNotHangIfStandardOutputRemainsOpenButProcessExits() async throws {
+        // PowerShell forks the sleeping grandchild (which inherits stdout
+        // since `Start-Process -NoNewWindow` copies the parent's std
+        // handles), prints the PID on stderr so we can capture it via
+        // `.sequence`, prints "GO" on stdout, and exits. The grandchild
+        // keeps the stdout write end alive — `.string(limit:)` on stdout
+        // is the call that would hang waiting for an EOF that never
+        // arrives.
+        let script = """
+            $ErrorActionPreference = 'Stop'
+            \(Self.spawnGrandchildSleep)
+            [Console]::Error.WriteLine($proc.Id)
+            Write-Output 'GO'
+            exit 0
+            """
+        let setup = TestSetup(
+            executable: .name("powershell.exe"),
+            arguments: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]
+        )
+
+        var grandchildPidToKill: DWORD = 0
+        defer { Self.killGrandchild(grandchildPidToKill) }
+
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .string(limit: 1024),
+            error: .sequence
+        ) { execution in
+            // The grandchild also inherits stderr, so the call can't
+            // iterate to EOF here. Read until a line parses as a PID and
+            // return — the I/O is cancelled once the child exits.
+            var iterator = execution.standardError.strings().makeAsyncIterator()
+            while let line = try await iterator.next() {
+                if let pid = DWORD(line) {
+                    return pid
+                }
+            }
+            return DWORD(0)
+        }
+
+        grandchildPidToKill = result.closureResult
+        #expect(grandchildPidToKill != 0)
+        #expect(result.terminationStatus == .exited(0))
+        #expect(result.standardOutput.contains("GO"))
+    }
+
+    @Test func testWeDoNotHangIfStandardErrorRemainsOpenButProcessExits() async throws {
+        // Mirror of the stdout test: PowerShell prints the PID on stdout
+        // (so we can capture it via `.sequence`) and "GO" on stderr, then
+        // exits. The grandchild keeps the stderr write end alive —
+        // `.string(limit:)` on stderr is the call that would hang.
+        let script = """
+            $ErrorActionPreference = 'Stop'
+            \(Self.spawnGrandchildSleep)
+            Write-Output $proc.Id
+            [Console]::Error.WriteLine('GO')
+            exit 0
+            """
+        let setup = TestSetup(
+            executable: .name("powershell.exe"),
+            arguments: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]
+        )
+
+        var grandchildPidToKill: DWORD = 0
+        defer { Self.killGrandchild(grandchildPidToKill) }
+
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .sequence,
+            error: .string(limit: 1024)
+        ) { execution in
+            var iterator = execution.standardOutput.strings().makeAsyncIterator()
+            while let line = try await iterator.next() {
+                if let pid = DWORD(line) {
+                    return pid
+                }
+            }
+            return DWORD(0)
+        }
+
+        grandchildPidToKill = result.closureResult
+        #expect(grandchildPidToKill != 0)
+        #expect(result.terminationStatus == .exited(0))
+        #expect(result.standardError.contains("GO"))
+    }
+}
+#endif // !os(Windows)
+
+// MARK: - Spawn retry tests
+#if !os(Windows)
+extension SubprocessIntegrationTests {
+    @Test func retriesUntilSuccess() async throws {
+        let counter = CallCounter()
+        let failuresBeforeSuccess = 3
+        let configuration = Configuration(executable: .name("true"))
+
+        let outcome = try await configuration.runSpawnAttemptsRetryingTransientFailure {
+            () async throws(SubprocessError) -> FakeSpawnOutcome in
+            let attempt = counter.increment()
+            return attempt <= failuresBeforeSuccess ? .transientFailure : .success
+        } shouldRetryTransientFailure: { outcome in
+            outcome == .transientFailure
+        }
+
+        #expect(outcome == .success)
+        #expect(counter.count == failuresBeforeSuccess + 1)
+    }
+
+    @Test func surfacesFailureAtCap() async throws {
+        let counter = CallCounter()
+        let configuration = Configuration(executable: .name("true"))
+
+        let outcome = try await configuration.runSpawnAttemptsRetryingTransientFailure {
+            () async throws(SubprocessError) -> FakeSpawnOutcome in
+            counter.increment()
+            return .transientFailure
+        } shouldRetryTransientFailure: { outcome in
+            outcome == .transientFailure
+        }
+
+        #expect(outcome == .transientFailure)
+        #expect(counter.count == 6 /* Configuration.maxSpawnAttempts */)
+    }
+
+    @Test func noRetryWhenNotTransient() async throws {
+        let counter = CallCounter()
+        let configuration = Configuration(executable: .name("true"))
+
+        let outcome = try await configuration.runSpawnAttemptsRetryingTransientFailure {
+            () async throws(SubprocessError) -> FakeSpawnOutcome in
+            counter.increment()
+            return .success
+        } shouldRetryTransientFailure: { outcome in
+            outcome == .transientFailure
+        }
+
+        #expect(outcome == .success)
+        #expect(counter.count == 1)
+    }
+
+    @Test func cancellationStopsRetrying() async throws {
+        let counter = CallCounter()
+        let configuration = Configuration(executable: .name("true"))
+
+        // No `await` between creating the task and cancelling it, so the task
+        // body cannot start until this function suspends at `task.value`, by
+        // which point cancellation is already requested. The first backoff
+        // therefore throws `CancellationError`, which the driver turns into
+        // the pending outcome rather than propagating.
+        let task = Task {
+            try await configuration.runSpawnAttemptsRetryingTransientFailure {
+                () async throws(SubprocessError) -> FakeSpawnOutcome in
+                counter.increment()
+                return .transientFailure
+            } shouldRetryTransientFailure: { outcome in
+                outcome == .transientFailure
+            }
+        }
+        task.cancel()
+
+        let outcome = try await task.value
+        #expect(outcome == .transientFailure)
+        #expect(counter.count < 6 /* Configuration.maxSpawnAttempts */)
+    }
+}
+#endif // !os(Windows)
+
 // MARK: - Other Tests
 extension SubprocessIntegrationTests {
     @Test func testTerminateProcess() async throws {
@@ -2093,7 +2982,7 @@ extension SubprocessIntegrationTests {
         )
         #else
         let setup = TestSetup(
-            executable: .path("/usr/bin/tail"),
+            executable: .name("tail"),
             arguments: ["-f", "/dev/null"]
         )
         #endif
@@ -2101,15 +2990,15 @@ extension SubprocessIntegrationTests {
             // This will intentionally hang
             setup,
             input: .none,
+            output: .discarded,
             error: .discarded
-        ) { subprocess, standardOutput in
+        ) { subprocess in
             // Make sure we can send signals to terminate the process
             #if os(Windows)
             try subprocess.terminate(withExitCode: 99)
             #else
             try subprocess.send(signal: .terminate)
             #endif
-            for try await _ in standardOutput {}
         }
 
         #if os(Windows)
@@ -2154,9 +3043,9 @@ extension SubprocessIntegrationTests {
             let length: Int
             switch size {
             case .large:
-                length = Int(Double.random(in: 1.0..<2.0) * Double(readBufferSize)) + 1
+                length = Int(Double.random(in: 1.0..<2.0) * Double(systemPageSize)) + 1
             case .medium:
-                length = Int(Double.random(in: 0.2..<1.0) * Double(readBufferSize)) + 1
+                length = Int(Double.random(in: 0.2..<1.0) * Double(systemPageSize)) + 1
             case .small:
                 length = Int.random(in: 1..<16)
             }
@@ -2243,10 +3132,11 @@ extension SubprocessIntegrationTests {
         _ = try await _run(
             setup,
             input: .none,
+            output: .sequence,
             error: .discarded
-        ) { execution, standardOutput in
+        ) { execution in
             var index = 0
-            for try await line in standardOutput.strings(as: UTF8.self) {
+            for try await line in execution.standardOutput.strings(as: UTF8.self) {
                 defer { index += 1 }
                 try #require(index < testCases.count, "Received more lines than expected")
                 #expect(
@@ -2264,7 +3154,7 @@ extension SubprocessIntegrationTests {
     }
 
     #if SubprocessFoundation
-    @Test func testCaptureLongStandardOutputAndError() async throws {
+    @Test(.disabled(if: isAndroid, "tee: /dev/stderr: Permission denied")) func testCaptureLongStandardOutputAndError() async throws {
         let string = String(repeating: "X", count: 100_000)
         #if os(Windows)
         let setup = TestSetup(
@@ -2276,7 +3166,7 @@ extension SubprocessIntegrationTests {
         )
         #else
         let setup = TestSetup(
-            executable: .path("/usr/bin/tee"),
+            executable: .name("tee"),
             arguments: ["/dev/stderr"]
         )
         #endif
@@ -2309,7 +3199,7 @@ extension SubprocessIntegrationTests {
         )
         #else
         let setup = TestSetup(
-            executable: .path("/usr/bin/tail"),
+            executable: .name("tail"),
             arguments: ["-f", "/dev/null"]
         )
         #endif
@@ -2392,28 +3282,28 @@ extension SubprocessIntegrationTests {
         )
         #endif
 
-        let result = try await _run(setup) { execution, standardInputWriter, standardOutput, standardError in
+        let result = try await _run(setup, input: .inputWriter, output: .sequence, error: .sequence) { execution in
             return try await withThrowingTaskGroup(of: OutputCaptureState?.self) { group in
                 group.addTask {
                     #if os(Windows)
-                    _ = try await standardInputWriter.write("echo off\n")
+                    _ = try await execution.standardInputWriter.write("echo off\n")
                     #endif
-                    _ = try await standardInputWriter.write("echo hello stdout\n")
-                    _ = try await standardInputWriter.write("echo >&2 hello stderr\n")
-                    _ = try await standardInputWriter.write("exit 0\n")
-                    try await standardInputWriter.finish()
+                    _ = try await execution.standardInputWriter.write("echo hello stdout\n")
+                    _ = try await execution.standardInputWriter.write("echo >&2 hello stderr\n")
+                    _ = try await execution.standardInputWriter.write("exit 0\n")
+                    try await execution.standardInputWriter.finish()
                     return nil
                 }
                 group.addTask {
                     var result = ""
-                    for try await line in standardOutput.strings() {
+                    for try await line in execution.standardOutput.strings() {
                         result += line
                     }
                     return .standardOutputCaptured(result.trimmingNewLineAndQuotes())
                 }
                 group.addTask {
                     var result = ""
-                    for try await line in standardError.strings() {
+                    for try await line in execution.standardError.strings() {
                         result += line
                     }
                     return .standardErrorCaptured(result.trimmingNewLineAndQuotes())
@@ -2439,11 +3329,11 @@ extension SubprocessIntegrationTests {
         #expect(result.terminationStatus.isSuccess)
         #if os(Windows)
         // cmd.exe interactive mode prints more info
-        #expect(result.value.output.contains("hello stdout"))
+        #expect(result.closureResult.output.contains("hello stdout"))
         #else
-        #expect(result.value.output == "hello stdout")
+        #expect(result.closureResult.output == "hello stdout")
         #endif
-        #expect(result.value.error == "hello stderr")
+        #expect(result.closureResult.error == "hello stderr")
     }
 
     @Test func testSubprocessPipeChain() async throws {
@@ -2473,7 +3363,7 @@ extension SubprocessIntegrationTests {
         else {
             throw SubprocessError.asyncIOFailed(
                 reason: "Failed to create pipe",
-                underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
             )
         }
         SetHandleInformation(readHandle, HANDLE_FLAG_INHERIT, 0)
@@ -2503,13 +3393,13 @@ extension SubprocessIntegrationTests {
                 else {
                     throw SubprocessError.asyncIOFailed(
                         reason: "Failed to create pipe",
-                        underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                        underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
                     )
                 }
                 guard let writeEndHandle else {
                     throw SubprocessError.asyncIOFailed(
                         reason: "Failed to create pipe",
-                        underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                        underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
                     )
                 }
                 CloseHandle(pipe.writeEnd) // No longer need the original
@@ -2556,13 +3446,13 @@ extension SubprocessIntegrationTests {
                 else {
                     throw SubprocessError.asyncIOFailed(
                         reason: "Failed to create pipe",
-                        underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                        underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
                     )
                 }
                 guard let readEndHandle else {
                     throw SubprocessError.asyncIOFailed(
                         reason: "Failed to create pipe",
-                        underlyingError: SubprocessError.WindowsError(rawValue: GetLastError())
+                        underlyingError: SubprocessError.WindowsError(win32Error: GetLastError())
                     )
                 }
                 CloseHandle(pipe.readEnd) // No longer need the original
@@ -2575,7 +3465,7 @@ extension SubprocessIntegrationTests {
                 let readEnd = FileDescriptor(rawValue: readEndFd)
                 #else
                 let setup = TestSetup(
-                    executable: .path("/usr/bin/tr"),
+                    executable: .name("tr"),
                     arguments: ["[:lower:]", "[:upper:]"]
                 )
                 let readEnd = pipe.readEnd
@@ -2588,7 +3478,7 @@ extension SubprocessIntegrationTests {
                 )
 
                 #expect(result.terminationStatus.isSuccess)
-                #expect(result.standardOutput?.trimmingNewLineAndQuotes() == "APPLE")
+                #expect(result.standardOutput.trimmingNewLineAndQuotes() == "APPLE")
             }
 
             try await group.waitForAll()
@@ -2654,9 +3544,9 @@ extension SubprocessIntegrationTests {
             )
             #endif
 
-            _ = try await _run(setup) { execution, inputWriter, standardOutput, standardError in
+            _ = try await _run(setup, input: .none, output: .sequence, error: .discarded) { execution in
                 var output: [String] = []
-                for try await line in standardOutput.strings(separatedBy: .lineBreaks) {
+                for try await line in execution.standardOutput.strings(separatedBy: .lineBreaks) {
                     output.append(line)
                 }
 
@@ -2677,15 +3567,15 @@ extension SubprocessIntegrationTests {
             arguments: ["-c", "/bin/echo -n x; /bin/echo >&2 -n y"]
         )
         #endif
-        _ = try await _run(setup) { execution, inputWriter, standardOutput, standardError in
+        _ = try await _run(setup, input: .inputWriter, output: .sequence, error: .sequence) { execution in
             try await withThrowingTaskGroup { group in
                 group.addTask {
-                    try await inputWriter.finish()
+                    try await execution.standardInputWriter.finish()
                 }
 
                 group.addTask {
                     var result = ""
-                    for try await line in standardOutput.strings() {
+                    for try await line in execution.standardOutput.strings() {
                         result += line
                     }
                     #expect(result.trimmingCharacters(in: .whitespaces) == "x")
@@ -2693,7 +3583,7 @@ extension SubprocessIntegrationTests {
 
                 group.addTask {
                     var result = ""
-                    for try await line in standardError.strings() {
+                    for try await line in execution.standardError.strings() {
                         result += line
                     }
                     #expect(result.trimmingCharacters(in: .whitespaces) == "y")
@@ -2726,9 +3616,9 @@ extension SubprocessIntegrationTests {
             ]
         )
         #endif
-        _ = try await _run(setup) { execution, inputWriter, standardOutput, standardError in
+        _ = try await _run(setup, input: .none, output: .sequence, error: .discarded) { execution in
             var output: [String] = []
-            for try await line in standardOutput.strings(separatedBy: .unicodeScalarSequence(["\0"])) {
+            for try await line in execution.standardOutput.strings(separatedBy: .unicodeScalarSequence(["\0"])) {
                 output.append(line)
             }
 
@@ -2755,9 +3645,9 @@ extension SubprocessIntegrationTests {
             ]
         )
         #endif
-        _ = try await _run(setup) { execution, inputWriter, standardOutput, standardError in
+        _ = try await _run(setup, input: .none, output: .sequence, error: .discarded) { execution in
             var output: [String] = []
-            for try await line in standardOutput.strings(separatedBy: .unicodeScalarSequence(["?", ":"])) {
+            for try await line in execution.standardOutput.strings(separatedBy: .unicodeScalarSequence(["?", ":"])) {
                 output.append(line)
             }
 
@@ -2787,9 +3677,9 @@ extension SubprocessIntegrationTests {
             ]
         )
         #endif
-        _ = try await _run(setup) { execution, inputWriter, standardOutput, standardError in
+        _ = try await _run(setup, input: .none, output: .sequence, error: .discarded) { execution in
             var output: [String] = []
-            for try await line in standardOutput.strings(separatedBy: .unicodeScalarSequence(["\u{2022}"])) {
+            for try await line in execution.standardOutput.strings(separatedBy: .unicodeScalarSequence(["\u{2022}"])) {
                 output.append(line)
             }
 
@@ -2820,9 +3710,9 @@ extension SubprocessIntegrationTests {
             ]
         )
         #endif
-        _ = try await _run(setup) { execution, inputWriter, standardOutput, standardError in
+        _ = try await _run(setup, input: .none, output: .sequence, error: .discarded) { execution in
             var output: [String] = []
-            for try await line in standardOutput.strings(separatedBy: .unicodeScalarSequence(["|"])) {
+            for try await line in execution.standardOutput.strings(separatedBy: .unicodeScalarSequence(["|"])) {
                 output.append(line)
             }
 
@@ -2849,9 +3739,11 @@ extension SubprocessIntegrationTests {
             ]
         )
         #endif
-        _ = try await _run(setup) { execution, inputWriter, standardOutput, standardError in
+        _ = try await _run(setup, input: .none, output: .sequence, error: .discarded) { execution in
             var output: [String] = []
-            for try await line in standardOutput.strings(separatedBy: .unicodeScalarSequence(["|"])) {
+            for try await line in execution.standardOutput.strings(
+                separatedBy: .unicodeScalarSequence(["|"])
+            ) {
                 output.append(line)
             }
 
@@ -2898,15 +3790,355 @@ extension SubprocessIntegrationTests {
         )
         #endif
 
-        _ = try await _run(setup) { execution, inputWriter, standardOutput, standardError in
+        _ = try await _run(setup, input: .none, output: .sequence, error: .sequence) { execution in
             var output: [String] = []
-            for try await line in standardOutput.strings() {
+            for try await line in execution.standardOutput.strings() {
                 output.append(line)
             }
             #expect(output == ["100°C", "32—x", "€5"])
         }
     }
+
+    @Test func testSubprocessTearsdownChildProcessWhenBodyThrows() async throws {
+        struct MyError: Swift.Error {}
+
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("powershell.exe"),
+            arguments: ["-Command", "Start-Sleep -Seconds 9999"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .name("tail"),
+            arguments: ["-f", "/dev/null"]
+        )
+        #endif
+        await #expect(throws: MyError.self) {
+            _ = try await _run(
+                setup,
+                input: .none,
+                output: .discarded,
+                error: .discarded
+            ) { execution in
+                throw MyError()
+            }
+        }
+    }
 }
+
+// MARK: - Streaming, Identity, and Input File Descriptor Tests
+extension SubprocessIntegrationTests {
+    @Test func testStreamingInputAndOutput() async throws {
+        // Stream input and output through one live process concurrently: a
+        // writer task feeds lines into standard input while a reader task reads
+        // the echoes back, in separate tasks (as in `testInteractiveShell`) so
+        // neither blocks the other.
+        #if os(Windows)
+        // A PowerShell loop that echoes each stdin line back and flushes so the
+        // reader sees it promptly.
+        let setup = TestSetup(
+            executable: .name("powershell.exe"),
+            arguments: [
+                "-NoProfile",
+                "-Command",
+                "while (($line = [Console]::In.ReadLine()) -ne $null) { [Console]::Out.WriteLine($line); [Console]::Out.Flush() }",
+            ]
+        )
+        #else
+        // `cat -u` echoes each line unbuffered, so the reader sees lines as they
+        // stream rather than only when the child exits.
+        let setup = TestSetup(
+            executable: .path("/bin/cat"),
+            arguments: ["-u"]
+        )
+        #endif
+
+        let lines = (0..<50).map { "line-\($0)" }
+        let result = try await _run(
+            setup,
+            input: .inputWriter,
+            output: .sequence,
+            error: .discarded
+        ) { execution in
+            return try await withThrowingTaskGroup(of: [String].self) { group in
+                // Writer: stream every line, then close stdin so the child exits.
+                group.addTask {
+                    for line in lines {
+                        _ = try await execution.standardInputWriter.write("\(line)\n")
+                    }
+                    try await execution.standardInputWriter.finish()
+                    return []
+                }
+                // Reader: collect the echoes concurrently until EOF.
+                group.addTask {
+                    var received: [String] = []
+                    for try await line in execution.standardOutput.strings() {
+                        let trimmed = line.trimmingNewLineAndQuotes()
+                        if !trimmed.isEmpty {
+                            received.append(trimmed)
+                        }
+                    }
+                    return received
+                }
+                var received: [String] = []
+                for try await partial in group where !partial.isEmpty {
+                    received = partial
+                }
+                return received
+            }
+        }
+        #expect(result.terminationStatus.isSuccess)
+        #expect(result.closureResult == lines)
+    }
+
+    @Test func testReadProcessIdentifier() async throws {
+        // The child reports its own process identifier. It must match the
+        // identifier Subprocess hands us via `execution.processIdentifier`.
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("powershell.exe"),
+            arguments: ["-NoProfile", "-Command", "Write-Output $PID"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/sh"),
+            arguments: ["-c", "echo $$"]
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .none,
+            output: .string(limit: 32),
+            error: .discarded
+        ) { execution in
+            return execution.processIdentifier.value
+        }
+        #expect(result.terminationStatus.isSuccess)
+        let reportedPid = result.standardOutput.trimmingNewLineAndQuotes()
+        #expect("\(result.closureResult)" == reportedPid)
+    }
+
+    @Test func testInputFromUnownedFileDescriptor() async throws {
+        // `closeAfterSpawningProcess: false` means the parent keeps ownership of
+        // the descriptor. The existing file-descriptor input tests all pass
+        // `true`, so this pins down the unowned case: after the run, the parent
+        // must still be able to close the descriptor itself.
+        let content = randomString(length: 64)
+        let fileURL = URL.temporaryDirectory
+            .appendingPathComponent("UnownedFDInput-\(UUID().uuidString).txt")
+        try content.write(to: fileURL, atomically: true, encoding: .utf8)
+        defer {
+            try? FileManager.default.removeItem(at: fileURL)
+        }
+        let inputFD: FileDescriptor = try .open(
+            FilePath(fileURL._fileSystemPath),
+            .readOnly
+        )
+
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "findstr x*"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/cat"),
+            arguments: []
+        )
+        #endif
+
+        let result = try await _run(
+            setup,
+            input: .fileDescriptor(inputFD, closeAfterSpawningProcess: false),
+            output: .string(limit: 256),
+            error: .discarded
+        )
+        #expect(result.terminationStatus.isSuccess)
+        #expect(result.standardOutput.trimmingNewLineAndQuotes() == content)
+        // The parent retained ownership, so closing here must succeed. If
+        // Subprocess had wrongly closed it, this might throw `.badFileDescriptor`.
+        try inputFD.close()
+    }
+
+    #if SubprocessFoundation
+    func testProcessExitsBeforeInputComplete() async throws {
+        // An input source that never yields and never finishes, paired with a
+        // child that exits immediately.
+        let neverEndingInput = AsyncStream<Data> { _ in
+            // Never yield, never finish.
+        }
+        #if os(Windows)
+        let setup = TestSetup(
+            executable: .name("cmd.exe"),
+            arguments: ["/c", "exit 0"]
+        )
+        #else
+        let setup = TestSetup(
+            executable: .path("/bin/sh"),
+            arguments: ["-c", "exit 0"]
+        )
+        #endif
+        let result = try await _run(
+            setup,
+            input: .sequence(neverEndingInput),
+            output: .discarded,
+            error: .discarded
+        )
+        #expect(result.terminationStatus == .exited(0))
+    }
+    #endif // SubprocessFoundation
+}
+
+// MARK: - Resource Management Tests
+
+#if !os(Android) // Exit tests are not supported on Android
+/// The number of open resources (file descriptors on POSIX, kernel handles on Windows) held by the current process.
+private func openResourceCount() -> Int? {
+    #if os(Windows)
+    var count: DWORD = 0
+    guard GetProcessHandleCount(GetCurrentProcess(), &count) else {
+        return nil
+    }
+    return Int(count)
+    #else
+    // Count open fds by probing each descriptor number up to the soft limit.
+    // This is portable across every POSIX target (Linux, Android, Darwin, the BSDs)
+    let limit = Int(min(_subprocess_nofile_soft_limit(), UInt64(4096)))
+    var count = 0
+    for fd in 0..<limit where fcntl(CInt(fd), F_GETFD) != -1 {
+        count += 1
+    }
+    return count
+    #endif
+}
+
+extension SubprocessIntegrationTests {
+    /// Run many subprocesses sequentially to make sure Subprocess does not leak fds.
+    ///
+    /// This test runs inside an exit test for two reasons:
+    ///
+    /// 1) Isolated process means no sibling test suites share its fd/handle table. That makes the
+    /// resource count deterministic and lets us assert a strict threshold
+    /// instead of relying on sampling/timing heuristics.
+    ///
+    /// 2) IODescriptor deinit now `fatalError`s if the descriptor is not closed. An exit test will
+    /// help us catch fd leaks without crashing the whole test suite.
+    @Test func testManySequentialRunsDoNotLeakResources() async throws {
+        await #expect(processExitsWith: .success) {
+            #if os(Windows)
+            let executable: Executable = .name("cmd.exe")
+            func makeArguments(_ i: Int) -> Arguments { ["/c", "echo", "hello-\(i)"] }
+            #else
+            let executable: Executable = .name("echo")
+            func makeArguments(_ i: Int) -> Arguments { ["hello-\(i)"] }
+            #endif
+
+            // Warm up once so lazily-created singletons (the process-monitor
+            // thread, AsyncIO's epoll/IOCP machinery, etc.) are allocated before
+            // we sample the baseline.
+            _ = try await Subprocess.run(executable, arguments: makeArguments(0), output: .string(limit: .max))
+            guard let before = openResourceCount() else {
+                #if compiler(>=6.3)
+                try Test.cancel("Cannot determine the number of open resources")
+                #else
+                return
+                #endif
+            }
+
+            let iterations = 500
+            for i in 0..<iterations {
+                let result = try await Subprocess.run(
+                    executable,
+                    arguments: makeArguments(i),
+                    output: .string(limit: .max)
+                )
+                precondition(result.terminationStatus.isSuccess)
+                precondition(result.standardOutput.contains("hello-\(i)") == true)
+            }
+
+            guard let after = openResourceCount() else {
+                #if compiler(>=6.3)
+                try Test.cancel("Cannot determine the number of open resources")
+                #else
+                return
+                #endif
+            }
+            let delta = after - before
+
+            precondition(
+                delta < iterations,
+                "Subprocess leaked \(delta) resources while iterating \(iterations) times."
+            )
+        }
+    }
+
+    /// Breaking out of a `.sequence` output stream before it reaches
+    /// end-of-stream must not leak the underlying pipe descriptor.
+    @Test func testBreakingOutOfSequenceOutputEarlyDoesNotLeakResources() async throws {
+        await #expect(processExitsWith: .success) {
+            #if os(Windows)
+            let executable: Executable = .name("cmd.exe")
+            func makeArguments(_ i: Int) -> Arguments { ["/c", "echo", "hello-\(i)"] }
+            #else
+            let executable: Executable = .name("echo")
+            func makeArguments(_ i: Int) -> Arguments { ["hello-\(i)"] }
+            #endif
+
+            // Warm up once so lazily-created singletons are allocated before
+            // we sample the baseline.
+            _ = try await Subprocess.run(
+                executable,
+                arguments: makeArguments(0),
+                input: .none,
+                output: .sequence,
+                error: .discarded
+            ) { execution in
+                for try await _ in execution.standardOutput {
+                    break
+                }
+            }
+            guard let before = openResourceCount() else {
+                #if compiler(>=6.3)
+                try Test.cancel("Cannot determine the number of open resources")
+                #else
+                return
+                #endif
+            }
+
+            let iterations = 200
+            for i in 0..<iterations {
+                _ = try await Subprocess.run(
+                    executable,
+                    arguments: makeArguments(i),
+                    input: .none,
+                    output: .sequence,
+                    error: .discarded
+                ) { execution in
+                    for try await _ in execution.standardOutput {
+                        // Stop consuming before end-of-stream, the way an
+                        // application that only wants the first chunk would.
+                        break
+                    }
+                }
+            }
+
+            guard let after = openResourceCount() else {
+                #if compiler(>=6.3)
+                try Test.cancel("Cannot determine the number of open resources")
+                #else
+                return
+                #endif
+            }
+            let delta = after - before
+
+            precondition(
+                delta < iterations,
+                "Subprocess leaked \(delta) resources while breaking out of .sequence output early \(iterations) times."
+            )
+        }
+    }
+}
+#endif // !os(Android)
 
 // MARK: - Utilities
 extension String {
@@ -2947,7 +4179,7 @@ func _run<
     input: Input,
     output: Output,
     error: Error
-) async throws -> ExecutionRecord<Output, Error> {
+) async throws -> ExecutionResult<Void, Output, Error> {
     return try await Subprocess.run(
         testSetup.executable,
         arguments: testSetup.arguments,
@@ -2969,7 +4201,7 @@ func _run<
     input: borrowing Span<InputElement>,
     output: Output,
     error: Error
-) async throws -> ExecutionRecord<Output, Error> {
+) async throws -> ExecutionResult<Void, Output, Error> {
     return try await Subprocess.run(
         testSetup.executable,
         arguments: testSetup.arguments,
@@ -2981,94 +4213,21 @@ func _run<
     )
 }
 
-func _run<
-    Result,
-    Input: InputProtocol,
-    Error: ErrorOutputProtocol
->(
+func _run<Result: ~Copyable, Input: InputProtocol, Output: OutputProtocol, Error: ErrorOutputProtocol>(
     _ setup: TestSetup,
     input: Input,
-    error: Error,
-    preferredBufferSize: Int? = nil,
-    body: ((Execution, AsyncBufferSequence) async throws -> Result)
-) async throws -> ExecutionOutcome<Result> where Error.OutputType == Void {
-    return try await Subprocess.run(
-        setup.executable,
-        arguments: setup.arguments,
-        environment: setup.environment,
-        workingDirectory: setup.workingDirectory,
-        input: input,
-        error: error,
-        preferredBufferSize: preferredBufferSize,
-        body: body
-    )
-}
-
-func _run<
-    Result,
-    Input: InputProtocol
->(
-    _ setup: TestSetup,
-    input: Input,
-    preferredBufferSize: Int? = nil,
-    body: ((Execution, AsyncBufferSequence, AsyncBufferSequence) async throws -> Result)
-) async throws -> ExecutionOutcome<Result> {
-    return try await Subprocess.run(
-        setup.executable,
-        arguments: setup.arguments,
-        environment: setup.environment,
-        workingDirectory: setup.workingDirectory,
-        input: input,
-        preferredBufferSize: preferredBufferSize,
-        body: body
-    )
-}
-
-func _run<
-    Result,
-    Error: ErrorOutputProtocol
->(
-    _ setup: TestSetup,
-    error: Error,
-    body: ((Execution, StandardInputWriter, AsyncBufferSequence) async throws -> Result)
-) async throws -> ExecutionOutcome<Result> where Error.OutputType == Void {
-    return try await Subprocess.run(
-        setup.executable,
-        arguments: setup.arguments,
-        environment: setup.environment,
-        workingDirectory: setup.workingDirectory,
-        error: error,
-        body: body
-    )
-}
-
-func _run<
-    Result,
-    Output: OutputProtocol
->(
-    _ setup: TestSetup,
     output: Output,
-    body: ((Execution, StandardInputWriter, AsyncBufferSequence) async throws -> Result)
-) async throws -> ExecutionOutcome<Result> where Output.OutputType == Void {
+    error: Error,
+    body: ((Execution<Input, Output, Error>) async throws -> Result)
+) async throws -> ExecutionResult<Result, Output, Error> {
     return try await Subprocess.run(
         setup.executable,
         arguments: setup.arguments,
         environment: setup.environment,
         workingDirectory: setup.workingDirectory,
+        input: input,
         output: output,
-        body: body
-    )
-}
-
-func _run<Result>(
-    _ setup: TestSetup,
-    body: ((Execution, StandardInputWriter, AsyncBufferSequence, AsyncBufferSequence) async throws -> Result)
-) async throws -> ExecutionOutcome<Result> {
-    return try await Subprocess.run(
-        setup.executable,
-        arguments: setup.arguments,
-        environment: setup.environment,
-        workingDirectory: setup.workingDirectory,
+        error: error,
         body: body
     )
 }
@@ -3098,3 +4257,32 @@ extension FileDescriptor {
         return result
     }
 }
+
+#if !os(Windows)
+/// A thread-safe call counter. The retry driver invokes `attempt` sequentially,
+/// but the cancellation test runs the driver inside a child `Task`, so the
+/// counter must be safe to capture into a `@Sendable` closure.
+private final class CallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    @discardableResult
+    func increment() -> Int {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        self.value += 1
+        return self.value
+    }
+
+    var count: Int {
+        self.lock.lock()
+        defer { self.lock.unlock() }
+        return self.value
+    }
+}
+
+private enum FakeSpawnOutcome: Sendable, Equatable {
+    case transientFailure
+    case success
+}
+#endif // !os(Windows)

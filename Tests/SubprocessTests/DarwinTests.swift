@@ -65,72 +65,14 @@ struct SubprocessDarwinTests {
             output: .string(limit: .max)
         )
         #expect(pwdResult.terminationStatus.isSuccess)
-        let currentDir = try #require(
-            pwdResult.standardOutput
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentDir = pwdResult.standardOutput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         // On Darwin, /var is linked to /private/var; /tmp is linked /private/tmp
         var expected = FilePath(intendedWorkingDir)
         if expected.starts(with: "/var") || expected.starts(with: "/tmp") {
             expected = FilePath("/private").appending(expected.components)
         }
         #expect(FilePath(currentDir) == expected)
-    }
-
-    @Test func testSuspendResumeProcess() async throws {
-        _ = try await Subprocess.run(
-            // This will intentionally hang
-            .path("/bin/cat"),
-            error: .discarded
-        ) { subprocess, standardOutput in
-            // First suspend the process
-            try subprocess.send(signal: .suspend)
-            var suspendedStatus: Int32 = 0
-            waitpid(subprocess.processIdentifier.value, &suspendedStatus, WNOHANG | WUNTRACED)
-            #expect(_was_process_suspended(suspendedStatus) > 0)
-            // Now resume the process
-            try subprocess.send(signal: .resume)
-            var resumedStatus: Int32 = 0
-            waitpid(subprocess.processIdentifier.value, &resumedStatus, WNOHANG | WUNTRACED)
-            #expect(_was_process_suspended(resumedStatus) == 0)
-
-            // Now kill the process
-            try subprocess.send(signal: .terminate)
-            for try await _ in standardOutput {}
-        }
-    }
-}
-
-extension FileDescriptor {
-    internal func readUntilEOF(upToLength maxLength: Int) async throws -> Data {
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, any Error>) in
-            let dispatchIO = DispatchIO(
-                type: .stream,
-                fileDescriptor: self.rawValue,
-                queue: .global()
-            ) { error in
-                if error != 0 {
-                    continuation.resume(throwing: POSIXError(.init(rawValue: error) ?? .ENODEV))
-                }
-            }
-            var buffer: Data = Data()
-            dispatchIO.read(
-                offset: 0,
-                length: maxLength,
-                queue: .global()
-            ) { done, data, error in
-                guard error == 0 else {
-                    continuation.resume(throwing: POSIXError(.init(rawValue: error) ?? .ENODEV))
-                    return
-                }
-                if let data = data {
-                    buffer += Data(data)
-                }
-                if done {
-                    dispatchIO.close()
-                    continuation.resume(returning: buffer)
-                }
-            }
-        }
     }
 }
 

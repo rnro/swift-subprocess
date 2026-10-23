@@ -14,7 +14,7 @@
 @preconcurrency import WinSDK
 import Foundation
 import Testing
-import Dispatch
+import Synchronization
 
 #if canImport(System)
 import System
@@ -56,11 +56,10 @@ extension SubprocessWindowsTests {
                 output: .string(limit: .max)
             )
 
-            try withKnownIssue {
+            withKnownIssue {
                 #expect(whoamiResult.terminationStatus.isSuccess)
-                let result = try #require(
-                    whoamiResult.standardOutput
-                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                let result = whoamiResult.standardOutput
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
                 // whoami returns `computerName\userName`.
                 let userInfo = result.split(separator: "\\")
                 guard userInfo.count == 2 else {
@@ -103,9 +102,8 @@ extension SubprocessWindowsTests {
             output: .string(limit: .max)
         )
         #expect(sameConsoleResult.terminationStatus.isSuccess)
-        let sameConsoleValue = try #require(
-            sameConsoleResult.standardOutput
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let sameConsoleValue = sameConsoleResult.standardOutput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         // Make sure the child console is same as parent
         #expect(
             "\(intptr_t(bitPattern: parentConsole))" == sameConsoleValue
@@ -123,9 +121,8 @@ extension SubprocessWindowsTests {
             output: .string(limit: .max)
         )
         #expect(differentConsoleResult.terminationStatus.isSuccess)
-        let differentConsoleValue = try #require(
-            differentConsoleResult.standardOutput
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let differentConsoleValue = differentConsoleResult.standardOutput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         // Make sure the child console is different from parent
         #expect(
             "\(intptr_t(bitPattern: parentConsole))" != differentConsoleValue
@@ -145,9 +142,8 @@ extension SubprocessWindowsTests {
             output: .string(limit: .max)
         )
         #expect(detachConsoleResult.terminationStatus.isSuccess)
-        let detachConsoleValue = try #require(
-            detachConsoleResult.standardOutput
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let detachConsoleValue = detachConsoleResult.standardOutput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         // Detached process should NOT have a console
         #expect(detachConsoleValue.isEmpty)
     }
@@ -169,9 +165,8 @@ extension SubprocessWindowsTests {
             output: .string(limit: .max)
         )
         #expect(newConsoleResult.terminationStatus.isSuccess)
-        let newConsoleValue = try #require(
-            newConsoleResult.standardOutput
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let newConsoleValue = newConsoleResult.standardOutput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         // Make sure the child console is different from parent
         #expect(
             "\(intptr_t(bitPattern: parentConsole))" != newConsoleValue
@@ -199,9 +194,8 @@ extension SubprocessWindowsTests {
             output: .string(limit: 32)
         )
         #expect(changeTitleResult.terminationStatus.isSuccess)
-        let newTitle = try #require(
-            changeTitleResult.standardOutput
-        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        let newTitle = changeTitleResult.standardOutput
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         // Make sure the child console is different from parent\
         #expect(newTitle == title)
     }
@@ -214,11 +208,12 @@ extension SubprocessWindowsTests {
             self.cmdExe,
             // This command will intentionally hang
             arguments: ["/c", "type con"],
+            input: .none,
+            output: .discarded,
             error: .discarded
-        ) { subprocess, standardOutput in
+        ) { subprocess in
             // Make sure we can kill the hung process
             try subprocess.terminate(withExitCode: 42)
-            for try await _ in standardOutput {}
         }
         // If we got here, the process was terminated
         guard case .exited(let exitCode) = stuckProcess.terminationStatus else {
@@ -233,8 +228,10 @@ extension SubprocessWindowsTests {
             self.cmdExe,
             // This command will intentionally hang
             arguments: ["/c", "type con"],
+            input: .none,
+            output: .discarded,
             error: .discarded
-        ) { subprocess, standardOutput in
+        ) { subprocess in
             try subprocess.suspend()
             // Now check the to make sure the process is actually suspended
             // Why not spawn another process to do that?
@@ -248,9 +245,8 @@ extension SubprocessWindowsTests {
                 output: .string(limit: .max)
             )
             #expect(checkResult.terminationStatus.isSuccess)
-            var isSuspended = try #require(
-                checkResult.standardOutput
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            var isSuspended = checkResult.standardOutput
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             #expect(isSuspended == "true")
 
             // Now resume the process
@@ -265,19 +261,19 @@ extension SubprocessWindowsTests {
                 output: .string(limit: .max)
             )
             #expect(checkResult.terminationStatus.isSuccess)
-            isSuspended = try #require(
-                checkResult.standardOutput
-            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            isSuspended = checkResult.standardOutput
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             #expect(isSuspended == "false")
 
             // Now finally kill the process since it's intentionally hung
             try subprocess.terminate(withExitCode: 0)
-            for try await _ in standardOutput {}
         }
         #expect(stuckProcess.terminationStatus.isSuccess)
     }
 
-    /// Tests a use case for Windows platform handles by assigning the newly created process to a Job Object
+    /// Tests a use case for Windows platform handles by assigning the newly
+    /// created process to a user-supplied Job Object, nested inside
+    /// Subprocess's internal job.
     /// - see: https://devblogs.microsoft.com/oldnewthing/20131209-00/
     @Test func testPlatformHandles() async throws {
         let hJob = CreateJobObjectW(nil, nil)
@@ -286,25 +282,710 @@ extension SubprocessWindowsTests {
         info.BasicLimitInformation.LimitFlags = DWORD(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
         #expect(SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &info, DWORD(MemoryLayout<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>.size)))
 
+        let result = try await Subprocess.run(
+            self.cmdExe,
+            arguments: ["/c", "echo"],
+            input: .none,
+            output: .discarded,
+            error: .discarded
+        ) { execution in
+            // Nest the child inside a user-supplied Job Object. Subprocess
+            // already assigned it to its internal job. This nests further.
+            guard AssignProcessToJobObject(hJob, execution.processIdentifier.processDescriptor) else {
+                throw SubprocessError.WindowsError(win32Error: GetLastError())
+            }
+        }
+        #expect(result.terminationStatus.isSuccess)
+    }
+}
+
+// MARK: - Job Object Termination Tests
+extension SubprocessWindowsTests {
+    @Test func testTerminateToProcessGroupKillsJobMembers() async throws {
+        _ = try await Subprocess.run(
+            self.cmdExe,
+            arguments: ["/c", "ping -n 60 127.0.0.1 > nul"],
+            input: .none,
+            output: .sequence,
+            error: .discarded
+        ) { execution in
+            let grandchildPid = try #require(
+                await Self.waitForChildPid(of: execution.processIdentifier.value, named: "ping.exe"),
+                "ping.exe did not appear as a child of cmd.exe"
+            )
+            let grandchildHandle = try #require(
+                OpenProcess(
+                    DWORD(SYNCHRONIZE) | DWORD(PROCESS_QUERY_LIMITED_INFORMATION),
+                    false,
+                    grandchildPid
+                ),
+                "Failed to open handle to grandchild process"
+            )
+            defer { _ = CloseHandle(grandchildHandle) }
+
+            #expect(Self.isProcessAlive(handle: grandchildHandle))
+
+            // Terminate the immediate child and any job members.
+            try execution.terminate(withExitCode: 0, toProcessGroup: true)
+
+            let exited = await Self.waitForProcessExit(handle: grandchildHandle)
+            #expect(exited, "Grandchild should have been terminated by TerminateJobObject")
+
+            for try await _ in execution.standardOutput {}
+        }
+    }
+
+    @Test func testTerminateWithoutProcessGroupLeavesJobMembers() async throws {
+        // The complement of `testTerminateToProcessGroupKillsJobMembers`.
+        // With `toProcessGroup: false`, `TerminateProcess` only affects the
+        // immediate child. Other job members, including grandchildren the
+        // child spawned, must survive and remain in the Job Object.
+        var grandchildHandleToCleanup: HANDLE?
+        defer {
+            if let handle = grandchildHandleToCleanup {
+                _ = TerminateProcess(handle, 0)
+                _ = CloseHandle(handle)
+            }
+        }
+
+        _ = try await Subprocess.run(
+            self.cmdExe,
+            arguments: ["/c", "ping -n 60 127.0.0.1 > nul"],
+            input: .none,
+            output: .sequence,
+            error: .discarded
+        ) { execution in
+            let grandchildPid = try #require(
+                await Self.waitForChildPid(of: execution.processIdentifier.value, named: "ping.exe"),
+                "ping.exe did not appear as a child of cmd.exe"
+            )
+            let grandchildHandle = try #require(
+                OpenProcess(
+                    DWORD(SYNCHRONIZE) | DWORD(PROCESS_QUERY_LIMITED_INFORMATION) | DWORD(PROCESS_TERMINATE),
+                    false,
+                    grandchildPid
+                ),
+                "Failed to open handle to grandchild process"
+            )
+            grandchildHandleToCleanup = grandchildHandle
+
+            #expect(Self.isProcessAlive(handle: grandchildHandle))
+
+            // Terminate only the immediate child.
+            try execution.terminate(withExitCode: 0, toProcessGroup: false)
+
+            // Give Windows a moment, then verify the grandchild is still alive
+            // and still a member of a Job Object. Membership confirms that
+            // Subprocess's internal job survived the per-process termination
+            // and continues to track descendants.
+            try await Task.sleep(for: .milliseconds(250))
+            #expect(
+                Self.isProcessAlive(handle: grandchildHandle),
+                "Grandchild should remain alive after toProcessGroup: false termination"
+            )
+
+            var inJob: WindowsBool = false
+            #expect(
+                IsProcessInJob(grandchildHandle, nil, &inJob),
+                "IsProcessInJob failed"
+            )
+            #expect(
+                inJob.boolValue,
+                "Grandchild should still be a job member after toProcessGroup: false termination"
+            )
+
+            for try await _ in execution.standardOutput {}
+        }
+    }
+
+    @Test func testPreSpawnConfiguratorCanOptIntoManualResume() async throws {
+        // Setting `CREATE_SUSPENDED` from `preSpawnProcessConfigurator`
+        // signals that user code will resume the child explicitly.
+        // Subprocess itself must not call `ResumeThread` in that case.
+        //
+        // Verify this by calling `ResumeThread` from the body closure and
+        // check the previous suspend count it returns. `1` means the child
+        // was still suspended (correct), and `0` means Subprocess has already
+        // resumed it (incorrect).
         var platformOptions = PlatformOptions()
-        platformOptions.preSpawnProcessConfigurator = { (createProcessFlags, startupInfo) in
-            createProcessFlags |= DWORD(CREATE_SUSPENDED)
+        platformOptions.preSpawnProcessConfigurator = { creationFlags, _ in
+            creationFlags |= DWORD(CREATE_SUSPENDED)
         }
 
         let result = try await Subprocess.run(
             self.cmdExe,
-            arguments: ["/c", "echo"],
+            arguments: ["/c", "echo hello"],
             platformOptions: platformOptions,
-            output: .discarded
-        ) { execution, _ in
-            guard AssignProcessToJobObject(hJob, execution.processIdentifier.processDescriptor) else {
-                throw SubprocessError.WindowsError(rawValue: GetLastError())
-            }
-            guard ResumeThread(execution.processIdentifier.threadHandle) != DWORD(bitPattern: -1) else {
-                throw SubprocessError.WindowsError(rawValue: GetLastError())
-            }
+            input: .none,
+            output: .discarded,
+            error: .discarded
+        ) { execution in
+            let previousSuspendCount = ResumeThread(execution.processIdentifier.threadHandle)
+            // Expect `1` since a greater suspend count means someone
+            // suspended the thread twice, and that should not happen.
+            #expect(previousSuspendCount == 1)
         }
         #expect(result.terminationStatus.isSuccess)
+    }
+}
+
+// MARK: - Batch File Argument Escaping (BatBadBut)
+extension SubprocessWindowsTests {
+    @Test func testIsWindowsBatchFileDetection() {
+        #expect("deploy.bat".isWindowsBatchFile)
+        #expect("DEPLOY.BAT".isWindowsBatchFile)
+        #expect("run.cmd".isWindowsBatchFile)
+        #expect("C:\\scripts\\go.CMD".isWindowsBatchFile)
+        // Windows strips trailing spaces and dots before resolving a path, so
+        // these still name a batch file. Not handling this was the
+        // CVE-2024-43402 bypass of the original BatBadBut fix.
+        #expect("deploy.bat. .".isWindowsBatchFile)
+        #expect("deploy.bat   ".isWindowsBatchFile)
+        #expect("deploy.bat...".isWindowsBatchFile)
+        // Not batch files.
+        #expect(!"tool.exe".isWindowsBatchFile)
+        #expect(!"tool".isWindowsBatchFile)
+        #expect(!"archive.bat.zip".isWindowsBatchFile)
+    }
+
+    @Test func testEscapeBatchFileArgument() throws {
+        // cmd.exe metacharacters are prefixed with `^` so cmd.exe passes them
+        // through literally instead of acting on them.
+        #expect(try Configuration.escapeBatchFileArgument("&calc") == "^&calc")
+        #expect(try Configuration.escapeBatchFileArgument("a&b|c") == "a^&b^|c")
+        #expect(try Configuration.escapeBatchFileArgument("50%") == "50^%")
+        // Arguments with whitespace are quoted (step 1); the quotes are then
+        // themselves `^`-escaped (step 2).
+        #expect(try Configuration.escapeBatchFileArgument("hello world") == "^\"hello world^\"")
+        // An embedded quote: escaped for CommandLineToArgvW (\"), then each
+        // resulting quote is escaped for cmd.exe (^").
+        #expect(try Configuration.escapeBatchFileArgument("a\"b") == "^\"a\\^\"b^\"")
+        // An empty argument is force-quoted so it isn't dropped entirely.
+        #expect(try Configuration.escapeBatchFileArgument("") == "^\"^\"")
+        // Characters that cannot be safely conveyed to cmd.exe are rejected.
+        #expect(throws: SubprocessError.self) {
+            _ = try Configuration.escapeBatchFileArgument("line1\nline2")
+        }
+        #expect(throws: SubprocessError.self) {
+            _ = try Configuration.escapeBatchFileArgument("has\rcarriage")
+        }
+        #expect(throws: SubprocessError.self) {
+            _ = try Configuration.escapeBatchFileArgument("has\u{0}nul")
+        }
+    }
+
+    @Test func testMakeBatchFileCommandLine() throws {
+        #expect(
+            try Configuration.makeBatchFileCommandLine(
+                scriptPath: "C:\\Temp\\noop.bat",
+                arguments: ["&calc"]
+            ) == "cmd.exe /d /e:ON /v:OFF /c \"\"C:\\Temp\\noop.bat\" ^&calc\""
+        )
+        // A script path that would break out of its quote pair is rejected.
+        #expect(throws: SubprocessError.self) {
+            _ = try Configuration.makeBatchFileCommandLine(
+                scriptPath: "C:\\Temp\\trailing\\",
+                arguments: []
+            )
+        }
+        #expect(throws: SubprocessError.self) {
+            _ = try Configuration.makeBatchFileCommandLine(
+                scriptPath: "C:\\Temp\\quo\"te.bat",
+                arguments: []
+            )
+        }
+    }
+
+    /// End-to-end proof that cmd.exe metacharacters in an argument to a real
+    /// `.bat` file are not interpreted by the implicitly-spawned cmd.exe.
+    @Test func testBatchFileArgumentsAreNotInterpretedByCmd() async throws {
+        // A throwaway directory with a batch file that echoes a sentinel and
+        // ignores its arguments. If escaping is correct, none of the payloads
+        // below can spawn the injected `echo` redirection, so no marker file
+        // is ever created and the sentinel is the only output.
+        let workingDirectory = URL.temporaryDirectory
+            .appendingPathComponent("subprocess-batbadbut-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: workingDirectory,
+            withIntermediateDirectories: true
+        )
+        defer {
+            try? FileManager.default.removeItem(at: workingDirectory)
+        }
+
+        let batchURL = workingDirectory.appendingPathComponent("noop.bat")
+        try "@echo off\r\necho RAN\r\nexit /b 0\r\n".write(
+            to: batchURL,
+            atomically: true,
+            encoding: .utf8
+        )
+        let batchPath = FilePath(batchURL._fileSystemPath)
+        let workingDirectoryPath = FilePath(workingDirectory._fileSystemPath)
+
+        // Each payload exercises a different cmd.exe injection technique. The
+        // marker file name is unique so a failure points at the payload.
+        let payloads: [(name: String, argument: String, marker: String)] = [
+            ("ampersand", "&echo pwned>inj_amp.txt", "inj_amp.txt"),
+            ("double-ampersand", "x&&echo pwned>inj_damp.txt", "inj_damp.txt"),
+            ("pipe", "x|echo pwned>inj_pipe.txt", "inj_pipe.txt"),
+            ("redirect", "x>inj_redir.txt", "inj_redir.txt"),
+            ("quote-breakout", "\"&echo pwned>inj_quote.txt&\"", "inj_quote.txt"),
+        ]
+
+        for payload in payloads {
+            let result = try await Subprocess.run(
+                .path(batchPath),
+                arguments: [payload.argument],
+                workingDirectory: workingDirectoryPath,
+                output: .string(limit: .max),
+                error: .discarded
+            )
+            // The batch file itself still runs successfully through cmd.exe...
+            #expect(
+                result.terminationStatus.isSuccess,
+                "Batch file did not run for payload \(payload.name)"
+            )
+            // ...and its only output is the sentinel (proving the argument was
+            // not interpreted as a redirection that swallowed the output).
+            #expect(
+                result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "RAN",
+                "Unexpected output for payload \(payload.name)"
+            )
+            // No injected command ran.
+            let markerURL = workingDirectory.appendingPathComponent(payload.marker)
+            let injected = FileManager.default.fileExists(atPath: markerURL._fileSystemPath)
+            #expect(!injected, "Command injection occurred for payload \(payload.name)")
+            if injected {
+                try? FileManager.default.removeItem(at: markerURL)
+            }
+        }
+    }
+}
+
+// MARK: - Environment
+extension SubprocessWindowsTests {
+    @Test func testEnvironmentKeyComparableMatchesEquatable() {
+        let upper: Environment.Key = "PATH"
+        let lower: Environment.Key = "path"
+        #expect(upper == lower)
+        #expect(!(upper < lower))
+        #expect(!(lower < upper))
+        #expect(!(upper > lower))
+        #expect(!(lower > upper))
+    }
+
+    @Test func testEnvironmentKeySortsCaseInsensitively() {
+        let keys: [Environment.Key] = ["Banana", "apple", "Kiwi"]
+        #expect(keys.sorted().map(\.rawValue) == ["apple", "Banana", "Kiwi"])
+    }
+
+    @Test func testEnvironmentKeyOrdinalSortMatchesWindowsBlockOrder() {
+        // Windows sorts the environment block case-insensitively in uppercase
+        // ordinal order, so '_' (0x5F) sorts after letters. "APPDATA" must
+        // therefore precede "APP_NAME".
+        let keys: [Environment.Key] = ["APP_NAME", "APPDATA"]
+        #expect(keys.sorted().map(\.rawValue) == ["APPDATA", "APP_NAME"])
+    }
+
+    @Test func testRejectInvalidEnvironment() async throws {
+        func _runTest(withEnvironment environment: Environment, errorReason: String) async {
+            let expectedError: SubprocessError = .spawnFailed(
+                withUnderlyingError: nil,
+                reason: errorReason
+            )
+
+            await #expect(throws: expectedError) {
+                _ = try await Subprocess.run(
+                    self.cmdExe,
+                    environment: environment,
+                    output: .discarded
+                )
+            }
+        }
+
+        await _runTest(
+            withEnvironment: .inherit.updating(["key=": "value"]),
+            errorReason: "Environment key 'key=' must not contain '='."
+        )
+
+        await _runTest(
+            withEnvironment: .inherit.updating(["key\0": "value"]),
+            errorReason: "Environment key 'key\0' must not contain null bytes."
+        )
+
+        await _runTest(
+            withEnvironment: .inherit.updating(["key": "value\0"]),
+            errorReason: "Environment value 'value\0' must not contain null bytes."
+        )
+
+        let longKey = randomString(length: 32767 / 2 + 1)
+        let longValue = randomString(length: 32767 / 2 + 1)
+        await _runTest(
+            withEnvironment: .inherit.updating([.init(longKey): longValue]),
+            errorReason: "Environment key and value pair must not exceed 32,767 characters."
+        )
+    }
+}
+
+// MARK: - Executable Resolution
+extension SubprocessWindowsTests {
+    /// Only the directories on `PATH` are searched, and only with the
+    /// extensions `PATHEXT` names. `CreateProcessW`'s own search would also
+    /// cover the application directory, the current directory, and the system
+    /// directories; `name(_:)` covers none of them.
+    @Test func testExecutablePathsAreLimitedToThePathValue() throws {
+        let paths = try Executable.name("test-bin").possibleExecutablePaths(
+            withPathValue: #"C:\first\path;C:\second\path"#
+        )
+        let pathsArray = Array(paths)
+
+        // Every candidate sits directly in one of the two `PATH` entries.
+        func isUnderAPathEntry(_ path: String) -> Bool {
+            let normalized = path.replacingOccurrences(of: "/", with: #"\"#).lowercased()
+            return normalized.hasPrefix(#"c:\first\path\"#)
+                || normalized.hasPrefix(#"c:\second\path\"#)
+        }
+        for path in pathsArray {
+            #expect(isUnderAPathEntry(path), "\(path) is outside the PATH value")
+        }
+
+        // `.exe` in the first `PATH` entry is among them, and the first entry
+        // is searched before the second.
+        let firstExe = try #require(
+            pathsArray.firstIndex(where: { Self.isSamePath($0, #"C:\first\path\test-bin.exe"#) })
+        )
+        let secondExe = try #require(
+            pathsArray.firstIndex(where: { Self.isSamePath($0, #"C:\second\path\test-bin.exe"#) })
+        )
+        #expect(firstExe < secondExe)
+
+        // Neither the current directory nor the system directory is a
+        // candidate, whatever they happen to be.
+        let systemDirectory = try fillNullTerminatedWideStringBuffer(
+            initialSize: DWORD(MAX_PATH),
+            maxSize: DWORD(Int16.max)
+        ) {
+            GetSystemDirectoryW($0.baseAddress, DWORD($0.count))
+        }
+        for directory in [FileManager.default.currentDirectoryPath, systemDirectory] {
+            let shadowed = FilePath(directory).appending("test-bin.exe").string
+            #expect(!pathsArray.contains(where: { Self.isSamePath($0, shadowed) }))
+        }
+    }
+
+    /// A `PATHEXT` extension is appended to the name, never substituted for an
+    /// extension the name already has, and a name that carries an extension is
+    /// tried as written first.
+    @Test func testExecutablePathsAppendExtensionsToDottedNames() throws {
+        let paths = try Executable.name("python3.11").possibleExecutablePaths(
+            withPathValue: #"C:\bin"#
+        )
+        let pathsArray = Array(paths)
+
+        let first = try #require(pathsArray.first)
+        #expect(Self.isSamePath(first, #"C:\bin\python3.11"#))
+        #expect(pathsArray.contains(where: { Self.isSamePath($0, #"C:\bin\python3.11.exe"#) }))
+        // `.11` must not be mistaken for the extension and replaced.
+        #expect(!pathsArray.contains(where: { Self.isSamePath($0, #"C:\bin\python3.exe"#) }))
+
+        // A name with no extension is only tried with extensions appended.
+        let extensionless = Array(
+            try Executable.name("test-bin").possibleExecutablePaths(withPathValue: #"C:\bin"#)
+        )
+        #expect(!extensionless.contains(where: { Self.isSamePath($0, #"C:\bin\test-bin"#) }))
+        #expect(extensionless.contains(where: { Self.isSamePath($0, #"C:\bin\test-bin.exe"#) }))
+        #expect(extensionless.contains(where: { Self.isSamePath($0, #"C:\bin\test-bin.cmd"#) }))
+    }
+
+    /// Empty entries, which a leading, trailing, or doubled `;` introduces, and
+    /// entries that aren't fully qualified are both a search of a current
+    /// directory, and are skipped. A drive-relative `C:bin` and a
+    /// root-relative `\bin` each depend on a current directory too.
+    @Test func testExecutablePathsSkipEmptyAndRelativeEntries() throws {
+        let relativeOnly = try Executable.name("test-bin").possibleExecutablePaths(
+            withPathValue: #";;relative\path;.;C:bin;\bin"#
+        )
+        #expect(Array(relativeOnly).isEmpty)
+
+        let empty = try Executable.name("test-bin").possibleExecutablePaths(withPathValue: "")
+        #expect(Array(empty).isEmpty)
+    }
+
+    /// `name(_:)` takes a name, so anything that names a location is rejected
+    /// rather than resolved against a current directory. Windows accepts either
+    /// slash, and `:` separates a drive from a drive-relative path.
+    @Test func testNameWithPathSeparatorIsRejected() async throws {
+        let names = [
+            #"bin\test-bin.exe"#,
+            #"bin/test-bin.exe"#,
+            #".\test-bin.exe"#,
+            #"C:\Windows\System32\cmd.exe"#,
+            "C:cmd.exe",
+        ]
+        for name in names {
+            #expect(throws: SubprocessError.self) {
+                _ = try Executable.name(name).possibleExecutablePaths(withPathValue: #"C:\bin"#)
+            }
+            let resolveError = await #expect(throws: SubprocessError.self) {
+                _ = try await Executable.name(name).resolveExecutablePath(in: .inherit)
+            }
+            #expect(resolveError?.code == .spawnFailed)
+            let spawnError = await #expect(throws: SubprocessError.self) {
+                _ = try await Subprocess.run(.name(name), output: .discarded)
+            }
+            #expect(spawnError?.code == .spawnFailed)
+        }
+    }
+
+    /// The current directory is not searched, so an executable that sits there
+    /// and nowhere on `PATH` is not found — not by resolution, and not by
+    /// `CreateProcessW`, whose own search would have found it.
+    @Test func testCurrentDirectoryIsNotSearched() async throws {
+        await #expect(processExitsWith: .success) {
+            // Runs in an isolated process because it changes the current
+            // directory, which is process-wide state that sibling suites
+            // running in the same process would otherwise observe.
+            try await SubprocessWindowsTests.withExecutableSearchFixture { shadow, bin, name in
+                // The executable exists only in what becomes the current directory.
+                try SubprocessWindowsTests.copyCmdExe(to: shadow.appendingPathComponent(name))
+                let originalDirectory = FileManager.default.currentDirectoryPath
+                // Restore before the fixture is removed: Windows refuses to
+                // delete a directory that is a process's current directory.
+                defer { _ = FileManager.default.changeCurrentDirectoryPath(originalDirectory) }
+                #expect(FileManager.default.changeCurrentDirectoryPath(shadow._fileSystemPath))
+
+                let environment = Environment.inherit.updating(["PATH": bin._fileSystemPath])
+                let resolveError = await #expect(throws: SubprocessError.self) {
+                    _ = try await Executable.name(name).resolveExecutablePath(in: environment)
+                }
+                #expect(resolveError?.code == .executableNotFound)
+
+                let spawnError = await #expect(throws: SubprocessError.self) {
+                    _ = try await Subprocess.run(
+                        .name(name),
+                        arguments: ["/c", "echo CURRENT-DIRECTORY"],
+                        environment: environment,
+                        output: .discarded
+                    )
+                }
+                #expect(spawnError?.code == .executableNotFound)
+            }
+        }
+    }
+
+    /// The working directory handed to `run` is where the subprocess starts,
+    /// not a directory the executable is looked for in.
+    @Test func testWorkingDirectoryIsNotSearched() async throws {
+        try await Self.withExecutableSearchFixture { shadowDirectory, binDirectory, name in
+            // The executable exists only in the working directory.
+            try Self.copyCmdExe(to: shadowDirectory.appendingPathComponent(name))
+
+            let spawnError = await #expect(throws: SubprocessError.self) {
+                _ = try await Subprocess.run(
+                    .name(name),
+                    arguments: ["/c", "echo WORKING-DIRECTORY"],
+                    environment: .inherit.updating(["PATH": binDirectory._fileSystemPath]),
+                    workingDirectory: FilePath(shadowDirectory._fileSystemPath),
+                    output: .discarded
+                )
+            }
+            #expect(spawnError?.code == .executableNotFound)
+        }
+    }
+
+    /// The `PATH` that a name resolves against is the subprocess's own, not
+    /// this process's. `CreateProcessW` reads `PATH` from the calling process
+    /// when it performs its own search, which is why Subprocess resolves the
+    /// name itself before calling it.
+    @Test func testResolutionUsesTheSubprocessPathValue() async throws {
+        try await Self.withExecutableSearchFixture { _, binDirectory, name in
+            let executable = binDirectory.appendingPathComponent(name)
+            try Self.copyCmdExe(to: executable)
+
+            // `binDirectory` is reachable only through the environment passed
+            // to the subprocess.
+            let environment = Environment.inherit.updating([
+                "PATH": binDirectory._fileSystemPath
+            ])
+            let resolved = try await Executable.name(name).resolveExecutablePath(in: environment)
+            #expect(Self.isSamePath(resolved.string, executable._fileSystemPath))
+
+            let result = try await Subprocess.run(
+                .name(name),
+                arguments: ["/c", "echo CHILD"],
+                environment: environment,
+                output: .string(limit: 32)
+            )
+            #expect(result.terminationStatus.isSuccess)
+            #expect(result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "CHILD")
+        }
+    }
+
+    /// With no `PATH` anywhere, the fallback is the set of directories
+    /// `CreateProcessW` searches on its own — minus the current directory, which
+    /// `name(_:)` never searches.
+    @Test func testDefaultSearchPathsAreTheSystemDirectories() throws {
+        let defaultSearchPaths = Executable.defaultSearchPaths
+        #expect(!defaultSearchPaths.isEmpty)
+        for directory in defaultSearchPaths {
+            #expect(FilePath(directory).isAbsolute, "\(directory) is not absolute")
+        }
+
+        let systemDirectory = try fillNullTerminatedWideStringBuffer(
+            initialSize: DWORD(MAX_PATH),
+            maxSize: DWORD(Int16.max)
+        ) {
+            GetSystemDirectoryW($0.baseAddress, DWORD($0.count))
+        }
+        #expect(defaultSearchPaths.contains(where: { Self.isSamePath($0, systemDirectory) }))
+        #expect(
+            !defaultSearchPaths.contains(where: {
+                Self.isSamePath($0, FileManager.default.currentDirectoryPath)
+            })
+        )
+
+        // Those directories, and only those, are what a `PATH`-less lookup walks.
+        func directoryPrefix(_ directory: String) -> String {
+            let normalized = directory.replacingOccurrences(of: "/", with: #"\"#).lowercased()
+            return normalized.hasSuffix(#"\"#) ? normalized : normalized + #"\"#
+        }
+        let paths = try Executable.name("test-bin").possibleExecutablePaths(withPathValue: nil)
+        for path in paths {
+            let normalized = path.replacingOccurrences(of: "/", with: #"\"#).lowercased()
+            #expect(
+                defaultSearchPaths.contains(where: { normalized.hasPrefix(directoryPrefix($0)) }),
+                "\(path) is outside the default search paths"
+            )
+        }
+    }
+
+    /// A `PATH` entry that contains a *directory* whose name matches the
+    /// executable must be skipped. `GetFileAttributesW` succeeds for a
+    /// directory, so the real executable later on `PATH` would otherwise be
+    /// shadowed.
+    @Test func testNameResolutionSkipsDirectoryInPathEntry() async throws {
+        try await Self.withExecutableSearchFixture { shadowDirectory, binDirectory, name in
+            // A directory that shares the executable's name, earlier on PATH
+            try FileManager.default.createDirectory(
+                at: shadowDirectory.appendingPathComponent(name),
+                withIntermediateDirectories: true
+            )
+            let executable = binDirectory.appendingPathComponent(name)
+            try Self.copyCmdExe(to: executable)
+
+            let resolved = try await Executable.name(name).resolveExecutablePath(
+                in: .inherit.updating([
+                    "PATH": "\(shadowDirectory._fileSystemPath);\(binDirectory._fileSystemPath)"
+                ])
+            )
+            #expect(Self.isSamePath(resolved.string, executable._fileSystemPath))
+        }
+    }
+
+    /// A directory candidate is dropped before it reaches `CreateProcessW`, and
+    /// the `ERROR_ACCESS_DENIED` branch in the spawn loop remains as a backstop
+    /// for a candidate that becomes a directory after the check. Neither must
+    /// abort the spawn while real candidates remain.
+    @Test func testSpawnSkipsDirectoryCandidateWithArgumentZeroOverride() async throws {
+        try await Self.withExecutableSearchFixture { shadowDirectory, binDirectory, name in
+            try FileManager.default.createDirectory(
+                at: shadowDirectory.appendingPathComponent(name),
+                withIntermediateDirectories: true
+            )
+            try Self.copyCmdExe(to: binDirectory.appendingPathComponent(name))
+
+            let result = try await Subprocess.run(
+                .name(name),
+                arguments: .init(
+                    executablePathOverride: name,
+                    remainingValues: ["/c", "echo REAL"]
+                ),
+                environment: .inherit.updating([
+                    "PATH": "\(shadowDirectory._fileSystemPath);\(binDirectory._fileSystemPath)"
+                ]),
+                output: .string(limit: 32)
+            )
+            #expect(result.terminationStatus.isSuccess)
+            #expect(result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines) == "REAL")
+        }
+    }
+
+    /// Reparse points must be classified by what they point at, not rejected
+    /// outright: `GetFileAttributesW` reports `REPARSE_POINT` alone for a file
+    /// symlink but `DIRECTORY|REPARSE_POINT` for a directory symlink or
+    /// junction. So a symlink to an executable still resolves, while one
+    /// pointing at a directory is skipped like any other directory.
+    @Test(.requiresSymbolicLinkPrivilege)
+    func testNameResolutionClassifiesSymlinksByTarget() async throws {
+        try await Self.withExecutableSearchFixture { shadowDirectory, binDirectory, name in
+            let target = binDirectory.appendingPathComponent("target-\(UUID().uuidString).exe")
+            try Self.copyCmdExe(to: target)
+            let targetDirectory = shadowDirectory.appendingPathComponent("target-directory")
+            try FileManager.default.createDirectory(
+                at: targetDirectory, withIntermediateDirectories: true
+            )
+            try FileManager.default.createSymbolicLink(
+                at: shadowDirectory.appendingPathComponent(name),
+                withDestinationURL: targetDirectory
+            )
+            try FileManager.default.createSymbolicLink(
+                at: binDirectory.appendingPathComponent(name),
+                withDestinationURL: target
+            )
+
+            let resolved = try await Executable.name(name).resolveExecutablePath(
+                in: .inherit.updating([
+                    "PATH": "\(shadowDirectory._fileSystemPath);\(binDirectory._fileSystemPath)"
+                ])
+            )
+            // The directory symlink was skipped; the symlink to the executable
+            // resolved without being followed to its target.
+            #expect(
+                Self.isSamePath(
+                    resolved.string,
+                    binDirectory.appendingPathComponent(name)._fileSystemPath
+                )
+            )
+        }
+    }
+
+    /// Compares two Windows paths, which may mix `/` and `\` separators and
+    /// differ in case.
+    private static func isSamePath(_ lhs: String, _ rhs: String) -> Bool {
+        func normalized(_ path: String) -> String {
+            path.replacingOccurrences(of: "/", with: "\\")
+        }
+        return normalized(lhs).caseInsensitiveCompare(normalized(rhs)) == .orderedSame
+    }
+
+    /// Creates a throwaway `shadow` and `bin` directory pair plus a unique
+    /// executable name, and removes them afterwards.
+    private static func withExecutableSearchFixture(
+        _ body: (URL, URL, String) async throws -> Void
+    ) async throws {
+        let fixture = URL.temporaryDirectory
+            .appendingPathComponent("executable-search-\(UUID().uuidString)")
+        let shadowDirectory = fixture.appendingPathComponent("shadow")
+        let binDirectory = fixture.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: shadowDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: binDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        try await body(shadowDirectory, binDirectory, "test-executable-\(UUID().uuidString).exe")
+    }
+
+    /// Copies `cmd.exe` to `destination` to stand in for an arbitrary
+    /// executable that the tests can both resolve and run.
+    private static func copyCmdExe(to destination: URL) throws {
+        let systemDirectory = try fillNullTerminatedWideStringBuffer(
+            initialSize: DWORD(MAX_PATH),
+            maxSize: DWORD(Int16.max)
+        ) {
+            GetSystemDirectoryW($0.baseAddress, DWORD($0.count))
+        }
+        try FileManager.default.copyItem(
+            at: URL(filePath: systemDirectory).appendingPathComponent("cmd.exe"),
+            to: destination
+        )
     }
 }
 
@@ -329,7 +1010,7 @@ extension SubprocessWindowsTests {
                     userInfo.usri1_priv = DWORD(USER_PRIV_USER)
                     userInfo.usri1_home_dir = nil
                     userInfo.usri1_comment = nil
-                    userInfo.usri1_flags = DWORD(UF_SCRIPT | UF_DONT_EXPIRE_PASSWD)
+                    userInfo.usri1_flags = DWORD(UF_SCRIPT) | DWORD(UF_DONT_EXPIRE_PASSWD)
                     userInfo.usri1_script_path = nil
 
                     var error: DWORD = 0
@@ -407,65 +1088,244 @@ extension SubprocessWindowsTests {
         // `isAdmin` is a `WindowsBool` and we need `Bool`
         return isAdmin.boolValue
     }
-}
 
-extension FileDescriptor {
-    internal func readUntilEOF(upToLength maxLength: Int) async throws -> Data {
-        // TODO: Figure out a better way to asynchronously read
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                var totalBytesRead: Int = 0
-                var lastError: DWORD? = nil
-                let values = [UInt8](
-                    unsafeUninitializedCapacity: maxLength
-                ) { buffer, initializedCount in
-                    while true {
-                        guard let baseAddress = buffer.baseAddress else {
-                            initializedCount = 0
-                            break
-                        }
-                        let bufferPtr = baseAddress.advanced(by: totalBytesRead)
-                        var bytesRead: DWORD = 0
-                        let readSucceed = ReadFile(
-                            self.platformDescriptor,
-                            UnsafeMutableRawPointer(mutating: bufferPtr),
-                            DWORD(maxLength - totalBytesRead),
-                            &bytesRead,
-                            nil
-                        )
-                        if !readSucceed {
-                            // Windows throws ERROR_BROKEN_PIPE when the pipe is closed
-                            let error = GetLastError()
-                            if error == ERROR_BROKEN_PIPE {
-                                // We are done reading
-                                initializedCount = totalBytesRead
-                            } else {
-                                // We got some error
-                                lastError = error
-                                initializedCount = 0
-                            }
-                            break
-                        } else {
-                            // We successfully read the current round
-                            totalBytesRead += Int(bytesRead)
-                        }
+    /// Finds the PID of a child of the given parent PID, optionally filtered
+    /// by executable name (case-insensitive), and returns the first match.
+    private static func findChildPid(
+        of parentPid: DWORD,
+        named name: String? = nil
+    ) throws -> DWORD? {
+        guard let snapshot = CreateToolhelp32Snapshot(DWORD(TH32CS_SNAPPROCESS), 0),
+            snapshot != INVALID_HANDLE_VALUE
+        else {
+            throw SubprocessError.WindowsError(win32Error: GetLastError())
+        }
+        defer { _ = CloseHandle(snapshot) }
 
-                        if totalBytesRead >= maxLength {
-                            initializedCount = min(maxLength, totalBytesRead)
-                            break
+        var entry = PROCESSENTRY32W()
+        entry.dwSize = DWORD(MemoryLayout<PROCESSENTRY32W>.size)
+
+        guard Process32FirstW(snapshot, &entry) else {
+            return nil
+        }
+        repeat {
+            if entry.th32ParentProcessID == parentPid {
+                if let name = name {
+                    let exeName = withUnsafePointer(to: entry.szExeFile) {
+                        $0.withMemoryRebound(
+                            to: WCHAR.self,
+                            capacity: Int(MAX_PATH)
+                        ) { ptr in
+                            String(decodingCString: ptr, as: UTF16.self)
                         }
                     }
-                }
-                if let lastError = lastError {
-                    let windowsError: SubprocessError = .failedToReadFromProcess(
-                        withUnderlyingError: SubprocessError.WindowsError(rawValue: lastError)
-                    )
-                    continuation.resume(throwing: windowsError)
+                    if exeName.lowercased() == name.lowercased() {
+                        return entry.th32ProcessID
+                    }
                 } else {
-                    continuation.resume(returning: Data(values))
+                    return entry.th32ProcessID
                 }
             }
+        } while Process32NextW(snapshot, &entry)
+
+        return nil
+    }
+
+    /// Polls until a child of the given parent PID appears, or the timeout
+    /// elapses.
+    private static func waitForChildPid(
+        of parentPid: DWORD,
+        named name: String? = nil,
+        timeout: Duration = .seconds(5)
+    ) async throws -> DWORD? {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let pid = try findChildPid(of: parentPid, named: name) {
+                return pid
+            }
+            try? await Task.sleep(for: .milliseconds(50))
         }
+        return nil
+    }
+
+    /// Returns `true` if `WaitForSingleObject` on the handle reports the
+    /// process as still running.
+    private static func isProcessAlive(handle: HANDLE) -> Bool {
+        return WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+    }
+
+    /// Asynchronously waits for the process referenced by the given handle
+    /// to exit, or for the given timeout to elapse. Returns `true` if the
+    /// process exited within the timeout.
+    private static func waitForProcessExit(
+        handle: HANDLE,
+        timeout: Duration = .seconds(5)
+    ) async -> Bool {
+        let handleBits = Int(bitPattern: handle)
+        return await withTaskGroup(of: Bool.self, returning: Bool.self) { group in
+            group.addTask {
+                let handle = HANDLE(bitPattern: handleBits)!
+                await waitForHandleSignal(handle: handle)
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return false
+            }
+            // First child task to finish wins. Cancel the other.
+            // `waitForHandleSignal` honors task cancellation and unwinds
+            // promptly so the group can return.
+            let first = await group.next()!
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// Asynchronously waits for the given handle to be signaled, using
+    /// `RegisterWaitForSingleObject`. Honors task cancellation by
+    /// unregistering the wait synchronously.
+    private static func waitForHandleSignal(handle: HANDLE) async {
+        // `Storage` holds Win32 pointer values whose provenance the region
+        // checker cannot verify, so it is `@unchecked Sendable`. All access
+        // is serialized through the `Mutex` that holds it.
+        struct Storage: @unchecked Sendable {
+            var waitHandle: HANDLE?
+            var contextRetained: UnsafeMutableRawPointer?
+        }
+        final class State: Sendable {
+            let storage = Mutex(Storage())
+            let continuation: AsyncStream<Void>.Continuation
+
+            init(continuation: AsyncStream<Void>.Continuation) {
+                self.continuation = continuation
+            }
+
+            /// Releases the retained `Unmanaged` context if it hasn't been
+            /// released yet, then finishes the stream. Idempotent.
+            func finishOnce() {
+                let context = self.storage.withLock { storage -> UnsafeMutableRawPointer? in
+                    let context = storage.contextRetained
+                    storage.contextRetained = nil
+                    return context
+                }
+                if let context {
+                    Unmanaged<AnyObject>.fromOpaque(context).release()
+                }
+                self.continuation.finish()
+            }
+        }
+
+        let (stream, streamContinuation) = AsyncStream.makeStream(of: Void.self)
+        let state = State(continuation: streamContinuation)
+
+        await withTaskCancellationHandler {
+            // Retain a reference to `state` for the C callback. The callback
+            // releases this retain after yielding.
+            let context = Unmanaged.passRetained(state).toOpaque()
+            state.storage.withLock { storage in
+                storage.contextRetained = context
+            }
+
+            let callback: WAITORTIMERCALLBACK = { context, _ in
+                let state = Unmanaged<State>.fromOpaque(context!)
+                    .takeRetainedValue()
+                // Clear `contextRetained` since we just consumed our own
+                // retain with `takeRetainedValue()`.
+                state.storage.withLock { storage in
+                    storage.contextRetained = nil
+                }
+                state.continuation.yield()
+                state.continuation.finish()
+            }
+
+            var waitHandle: HANDLE?
+            let flags = ULONG(WT_EXECUTEONLYONCE | WT_EXECUTELONGFUNCTION)
+            guard
+                RegisterWaitForSingleObject(
+                    &waitHandle,
+                    handle,
+                    callback,
+                    context,
+                    INFINITE,
+                    flags
+                )
+            else {
+                // Registration failed. Finish the stream immediately. The
+                // caller's timeout path handles the apparent non-exit.
+                state.finishOnce()
+                // Wait for the iteration below to observe the finish.
+                for await _ in stream {}
+                return
+            }
+
+            state.storage.withLock { storage in
+                storage.waitHandle = waitHandle
+            }
+
+            // Wait for either the callback to yield, or for cancellation
+            // to finish the stream. Either way, the iteration ends after
+            // observing the (single) yielded value or the finish.
+            for await _ in stream { break }
+
+            // Unregister the wait. `INVALID_HANDLE_VALUE` tells
+            // `UnregisterWaitEx` to wait synchronously for any in-flight
+            // callbacks.
+            let waitHandleToUnregister = state.storage.withLock { storage -> HANDLE? in
+                let handle = storage.waitHandle
+                storage.waitHandle = nil
+                return handle
+            }
+            if let waitHandleToUnregister {
+                _ = UnregisterWaitEx(waitHandleToUnregister, INVALID_HANDLE_VALUE)
+            }
+        } onCancel: {
+            // Cancellation path. Unregister the wait synchronously, then
+            // finish the stream so the awaiting `for await` returns.
+            let waitHandleToUnregister = state.storage.withLock { storage -> HANDLE? in
+                let handle = storage.waitHandle
+                storage.waitHandle = nil
+                return handle
+            }
+            if let waitHandleToUnregister {
+                _ = UnregisterWaitEx(waitHandleToUnregister, INVALID_HANDLE_VALUE)
+            }
+            state.finishOnce()
+        }
+    }
+}
+
+extension Trait where Self == ConditionTrait {
+    /// Creating a symbolic link on Windows requires
+    /// `SeCreateSymbolicLinkPrivilege`, which an unelevated process only holds
+    /// when Developer Mode is enabled.
+    static var requiresSymbolicLinkPrivilege: Self {
+        enabled(
+            "This test requires the privilege to create symbolic links (enable Developer Mode)",
+            {
+                let directory = URL.temporaryDirectory
+                    .appendingPathComponent("symlink-probe-\(UUID().uuidString)")
+                guard
+                    let _ = try? FileManager.default.createDirectory(
+                        at: directory,
+                        withIntermediateDirectories: true
+                    )
+                else {
+                    return false
+                }
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let link = directory.appendingPathComponent("link")
+                do {
+                    try FileManager.default.createSymbolicLink(
+                        at: link,
+                        withDestinationURL: directory
+                    )
+                    return true
+                } catch {
+                    return false
+                }
+            }
+        )
     }
 }
 

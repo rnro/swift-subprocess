@@ -16,7 +16,6 @@ import SystemPackage
 #endif
 
 #if !os(Windows)
-internal import Dispatch
 
 #if SubprocessFoundation
 
@@ -31,34 +30,46 @@ internal import FoundationEssentials
 #endif
 #endif
 
+#if canImport(Synchronization)
+import Synchronization
+#endif
+
+#if canImport(os)
+import os
+#endif
+
 /// An asynchronous sequence of buffers that streams output from a subprocess.
-public struct AsyncBufferSequence: AsyncSequence, @unchecked Sendable {
+///
+/// - Important: This sequence is single-pass and can be iterated only once.
+///   See ``makeAsyncIterator()``.
+public struct SubprocessOutputSequence: AsyncSequence, @unchecked Sendable {
     /// The failure type for the asynchronous sequence.
     public typealias Failure = any Swift.Error
     /// The element type for the asynchronous sequence.
     public typealias Element = Buffer
 
-    #if SUBPROCESS_ASYNCIO_DISPATCH
-    internal typealias DiskIO = DispatchIO
-    #elseif canImport(WinSDK)
+    #if canImport(WinSDK)
     internal typealias DiskIO = HANDLE
     #else
     internal typealias DiskIO = FileDescriptor
     #endif
 
-    /// An iterator for ``AsyncBufferSequence``.
+    /// An iterator that yields raw output buffers from the subprocess.
     public struct Iterator: AsyncIteratorProtocol {
         /// The element type for the iterator.
         public typealias Element = Buffer
 
         private let diskIO: DiskIO
+        private let processIdentifier: ProcessIdentifier
         private let preferredBufferSize: Int
         private var buffer: [Buffer]
 
-        internal init(diskIO: DiskIO, preferredBufferSize: Int?) {
+        internal init(diskIO: DiskIO, processIdentifier: ProcessIdentifier) {
             self.diskIO = diskIO
+            self.processIdentifier = processIdentifier
             self.buffer = []
-            self.preferredBufferSize = preferredBufferSize ?? readBufferSize
+            // Only need to query it once at beginning of stream
+            self.preferredBufferSize = AsyncIO.queryPipeBufferSize(for: diskIO)
         }
 
         /// Retrieves the next buffer in the sequence, or `nil` if the sequence ended.
@@ -70,53 +81,67 @@ public struct AsyncBufferSequence: AsyncSequence, @unchecked Sendable {
             // Read more data
             let data = try await AsyncIO.shared.read(
                 from: self.diskIO,
+                for: self.processIdentifier,
                 upTo: self.preferredBufferSize
             )
             guard let data else {
-                // We finished reading. Close the file descriptor now
-                #if SUBPROCESS_ASYNCIO_DISPATCH
-                try _safelyClose(.dispatchIO(self.diskIO))
-                #elseif canImport(WinSDK)
-                try _safelyClose(.handle(self.diskIO))
-                #else
-                try _safelyClose(.fileDescriptor(self.diskIO))
-                #endif
+                // We finished reading, but don't close the descriptor here:
+                // `run` owns closing it exactly once, at the end of the
+                // scope in which this sequence is valid, whether or not the
+                // sequence was ever iterated or was fully drained. See
+                // `SubprocessOutputSequence.close()`.
                 return nil
             }
-            let createdBuffers = Buffer.createFrom(data)
-            // Most (all?) cases there should be only one buffer
-            // because DispatchData are mostly contiguous
-            if _fastPath(createdBuffers.count == 1) {
-                // No need to push to the stack
-                return createdBuffers[0]
-            }
-            self.buffer = createdBuffers
-            return self.buffer.removeFirst()
+            return Buffer(data: data)
         }
 
         /// Retrieves the next buffer in the sequence, or `nil` if the sequence ended.
-        public mutating func next() async throws -> AsyncBufferSequence.Buffer? {
+        public mutating func next() async throws -> SubprocessOutputSequence.Buffer? {
             return try await self.next(isolation: nil)
         }
     }
 
     private let diskIO: DiskIO
-    private let preferredBufferSize: Int?
+    private let processIdentifier: ProcessIdentifier
+    private let state: State
 
-    internal init(diskIO: DiskIO, preferredBufferSize: Int?) {
+    internal init(diskIO: DiskIO, processIdentifier: ProcessIdentifier) {
         self.diskIO = diskIO
-        self.preferredBufferSize = preferredBufferSize
+        self.processIdentifier = processIdentifier
+        self.state = State()
     }
 
     /// Creates an iterator for this asynchronous sequence.
+    ///
+    /// - Precondition: `SubprocessOutputSequence` is single-pass; creating a
+    ///   second iterator results in a fatal error.
     public func makeAsyncIterator() -> Iterator {
-        return Iterator(
-            diskIO: self.diskIO,
-            preferredBufferSize: self.preferredBufferSize
-        )
+        guard self.state.initializedCount() == 1 else {
+            fatalError("SubprocessOutputSequence is single-pass. It can only be iterated once.")
+        }
+        return Iterator(diskIO: self.diskIO, processIdentifier: self.processIdentifier)
+    }
+
+    /// Closes the underlying descriptor.
+    ///
+    /// `run` calls this exactly once the body closure that received this
+    /// sequence returns or throws, whether or not the sequence was ever
+    /// iterated, or was fully drained to end-of-stream first. The iterator
+    /// itself never closes the descriptor, so a caller that stops consuming
+    /// the sequence before end-of-stream (for example, `break`ing out of a
+    /// `for await` loop early) doesn't leak it.
+    internal func close() throws(SubprocessError) {
+        #if canImport(WinSDK)
+        try _safelyClose(.handle(self.diskIO))
+        #else
+        try _safelyClose(.fileDescriptor(self.diskIO))
+        #endif
     }
 
     /// Splits the buffer into strings using the specified separator.
+    ///
+    /// The separator characters are not included in the returned strings,
+    /// similar to how `.split(separator:)` works. See ``StringSequence``.
     ///
     /// - Parameters:
     ///   - separator: The delimiter to split on. The default
@@ -138,8 +163,11 @@ public struct AsyncBufferSequence: AsyncSequence, @unchecked Sendable {
         )
     }
 
-    /// Splits the buffer into strings with the given encoding
+    /// Splits the buffer into strings with the encoding you provide
     /// and separator.
+    ///
+    /// The separator characters are not included in the returned strings,
+    /// similar to how `.split(separator:)` works. See ``StringSequence``.
     ///
     /// - Parameters:
     ///   - separator: The delimiter to split on. The default
@@ -150,7 +178,7 @@ public struct AsyncBufferSequence: AsyncSequence, @unchecked Sendable {
     ///   - encoding: The Unicode encoding to decode with.
     /// - Returns: A ``StringSequence`` that iterates through
     ///   the buffer contents as strings.
-    public func strings<Encoding: _UnicodeEncoding>(
+    public func strings<Encoding: _UnicodeEncoding & Sendable>(
         separatedBy separator: StringSequence<Encoding>.Separator = .lineBreaks,
         bufferingPolicy: StringSequence<Encoding>.BufferingPolicy = .maxLineLength(128 * 1024),
         as encoding: Encoding.Type,
@@ -165,16 +193,46 @@ public struct AsyncBufferSequence: AsyncSequence, @unchecked Sendable {
 }
 
 @available(*, unavailable)
-extension AsyncBufferSequence.Iterator: Sendable {}
+extension SubprocessOutputSequence.Iterator: Sendable {}
+
+extension SubprocessOutputSequence {
+    private final class State {
+        #if os(macOS)
+        private let value: OSAllocatedUnfairLock<Int>
+        #else
+        private let value: Atomic<Int>
+        #endif
+
+        init() {
+            #if os(macOS)
+            self.value = OSAllocatedUnfairLock(initialState: 0)
+            #else
+            self.value = Atomic(0)
+            #endif
+        }
+
+        func initializedCount() -> Int {
+            #if os(macOS)
+            return self.value.withLock { state in
+                state += 1
+                return state
+            }
+            #else
+            return self.value.add(1, ordering: .sequentiallyConsistent).newValue
+            #endif
+        }
+    }
+}
 
 // MARK: - StringSequence
-extension AsyncBufferSequence {
+extension SubprocessOutputSequence {
     /// An asynchronous sequence of strings parsed from a buffer
     /// sequence.
     ///
     /// By default, the sequence splits on Unicode line break
     /// characters. You can supply a custom separator with the
-    /// ``Separator/unicodeScalarSequence(_:)`` factory method.
+    /// ``Separator/unicodeScalarSequence(_:)-(Sequence<Unicode.Scalar>)``
+    /// factory method.
     ///
     /// The following Unicode characters are recognized as line
     /// breaks:
@@ -193,23 +251,23 @@ extension AsyncBufferSequence {
     /// strings, similar to how `.split(separator:)` works.
     ///
     /// When you use a custom separator created with
-    /// ``Separator/unicodeScalarSequence(_:)``, the sequence performs a
-    /// code-unit-level comparison without Unicode normalization.
-    /// See ``Separator/unicodeScalarSequence(_:)`` for details.
-    public struct StringSequence<Encoding: _UnicodeEncoding>: AsyncSequence, Sendable {
+    /// ``Separator/unicodeScalarSequence(_:)-(Sequence<Unicode.Scalar>)``, the
+    /// sequence performs a code-unit-level comparison without Unicode normalization.
+    /// See ``Separator/unicodeScalarSequence(_:)-(Sequence<Unicode.Scalar>)`` for details.
+    public struct StringSequence<Encoding: _UnicodeEncoding & Sendable>: AsyncSequence, Sendable {
         /// The element type for the asynchronous sequence.
         public typealias Element = String
 
-        private let base: AsyncBufferSequence
+        private let base: SubprocessOutputSequence
         private let bufferingPolicy: BufferingPolicy
         private let separator: Separator
 
-        /// An iterator for ``StringSequence``.
-        public struct AsyncIterator: AsyncIteratorProtocol {
-            /// The element type for this Iterator.
+        /// An iterator that yields individual lines of subprocess output.
+        public struct AsyncIterator: nonisolated AsyncIteratorProtocol {
+            /// The element type for this iterator.
             public typealias Element = String
 
-            private var source: AsyncBufferSequence.AsyncIterator
+            private var source: SubprocessOutputSequence.AsyncIterator
             private var buffer: [Encoding.CodeUnit]
             private var underlyingBuffer: [Encoding.CodeUnit]
             private var underlyingBufferIndex: Array<Encoding.CodeUnit>.Index
@@ -220,7 +278,7 @@ extension AsyncBufferSequence {
             private let separatorCodeUnits: [Encoding.CodeUnit]
 
             internal init(
-                underlyingIterator: AsyncBufferSequence.AsyncIterator,
+                underlyingIterator: SubprocessOutputSequence.AsyncIterator,
                 bufferingPolicy: BufferingPolicy,
                 separator: Separator
             ) {
@@ -268,29 +326,12 @@ extension AsyncBufferSequence {
                         self.eofReached = true
                         return nil
                     }
-                    #if SUBPROCESS_ASYNCIO_DISPATCH
-                    // Unfortunately here we _have to_ copy the bytes out because
-                    // DispatchIO (rightfully) reuses buffer, which means `buffer.data`
-                    // has the same address on all iterations, therefore we can't directly
-                    // create the result array from buffer.data
-
-                    // Calculate how many CodePoint elements we have
-                    let elementCount = buffer.data.count / MemoryLayout<Encoding.CodeUnit>.stride
-
-                    // Create array by copying from the buffer reinterpreted as CodePoint
-                    let result: Array<Encoding.CodeUnit> = buffer.data.withUnsafeBytes { ptr -> Array<Encoding.CodeUnit> in
-                        return Array(
-                            UnsafeBufferPointer(start: ptr.baseAddress?.assumingMemoryBound(to: Encoding.CodeUnit.self), count: elementCount)
-                        )
-                    }
-                    #else
                     // Cast data to CodeUnit type
                     let result = buffer.withUnsafeBytes { ptr in
                         return ptr.withMemoryRebound(to: Encoding.CodeUnit.self) { codeUnitPtr in
                             return Array(codeUnitPtr)
                         }
                     }
-                    #endif
                     return result.isEmpty ? nil : result
                 }
 
@@ -473,7 +514,7 @@ extension AsyncBufferSequence {
         }
 
         internal init(
-            underlying: AsyncBufferSequence,
+            underlying: SubprocessOutputSequence,
             encoding: Encoding.Type,
             bufferingPolicy: BufferingPolicy,
             separator: Separator
@@ -486,21 +527,20 @@ extension AsyncBufferSequence {
 }
 
 @available(*, unavailable)
-extension AsyncBufferSequence.StringSequence.AsyncIterator: Sendable {}
+extension SubprocessOutputSequence.StringSequence.AsyncIterator: Sendable {}
 
-extension AsyncBufferSequence.StringSequence {
+extension SubprocessOutputSequence.StringSequence {
     /// A strategy for handling buffer capacity.
     public enum BufferingPolicy: Sendable {
         /// Adds to the buffer without imposing a limit on line length.
         case unbounded
         /// Imposes a maximum line length limit.
         ///
-        /// The subprocess throws an error if a line exceeds this limit.
+        /// Iterating the output throws a ``SubprocessError`` if a line exceeds this limit.
         case maxLineLength(Int)
     }
 
-    /// A delimiter that determines where a ``StringSequence``
-    /// splits its input.
+    /// A delimiter that determines where the output line sequence splits its input.
     public struct Separator: Sendable, Hashable {
         internal enum Storage: Sendable, Hashable {
             case lineBreaks
@@ -514,6 +554,7 @@ extension AsyncBufferSequence.StringSequence {
         }
 
         /// Splits on Unicode line break characters.
+        ///
         /// The following Unicode characters are recognized as line
         /// breaks:
         /// ```
@@ -604,6 +645,6 @@ private let _pageSize: Int = Int(getpagesize())
 #endif // canImport(Darwin)
 
 @inline(__always)
-internal var readBufferSize: Int {
+internal var systemPageSize: Int {
     return _pageSize
 }

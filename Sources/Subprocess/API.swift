@@ -18,7 +18,8 @@ public import SystemPackage
 // MARK: - Collected Result
 
 /// Runs an executable asynchronously and returns the collected output
-/// of the child process.
+/// of the subprocess.
+///
 /// - Parameters:
 ///   - executable: The executable to run.
 ///   - arguments: The arguments to pass to the executable.
@@ -28,7 +29,11 @@ public import SystemPackage
 ///   - input: The input to send to the executable.
 ///   - output: The method to use for redirecting standard output.
 ///   - error: The method to use for redirecting standard error.
-/// - Returns: An ``ExecutionRecord`` that contains the result of the run.
+/// - Returns: An ``ExecutionResult`` that contains the result of the run.
+/// - Throws: A ``SubprocessError`` if the subprocess can't be launched, for
+///   example when the executable isn't found, or if the collected output
+///   exceeds the limit you set. A non-zero exit code is a normal result, not
+///   a thrown error; inspect ``ExecutionResult/terminationStatus`` instead.
 public func run<
     Input: InputProtocol,
     Output: OutputProtocol,
@@ -42,7 +47,7 @@ public func run<
     input: Input = .none,
     output: Output,
     error: Error = .discarded
-) async throws -> ExecutionRecord<Output, Error> {
+) async throws -> ExecutionResult<Void, Output, Error> {
     let configuration = Configuration(
         executable: executable,
         arguments: arguments,
@@ -59,7 +64,8 @@ public func run<
 }
 
 /// Runs an executable asynchronously and returns the collected output
-/// of the child process.
+/// of the subprocess.
+///
 /// - Parameters:
 ///   - executable: The executable to run.
 ///   - arguments: The arguments to pass to the executable.
@@ -69,7 +75,11 @@ public func run<
 ///   - input: A span to write to the subprocess's standard input.
 ///   - output: The method to use for redirecting standard output.
 ///   - error: The method to use for redirecting standard error.
-/// - Returns: An ``ExecutionRecord`` that contains the result of the run.
+/// - Returns: An ``ExecutionResult`` that contains the result of the run.
+/// - Throws: A ``SubprocessError`` if the subprocess can't be launched, for
+///   example when the executable isn't found, or if the collected output
+///   exceeds the limit you set. A non-zero exit code is a normal result, not
+///   a thrown error; inspect ``ExecutionResult/terminationStatus`` instead.
 public func run<
     InputElement: BitwiseCopyable,
     Output: OutputProtocol,
@@ -83,7 +93,7 @@ public func run<
     input: borrowing Span<InputElement>,
     output: Output,
     error: Error = .discarded
-) async throws -> ExecutionRecord<Output, Error> {
+) async throws -> ExecutionResult<Void, Output, Error> {
     let configuration = Configuration(
         executable: executable,
         arguments: arguments,
@@ -101,8 +111,15 @@ public func run<
 
 // MARK: - Custom Execution Body
 
-/// Runs an executable with given parameters and a custom closure
-/// to manage the running subprocess’s lifetime.
+/// Runs an executable asynchronously and lets a closure manage the running subprocess.
+///
+/// Use this overload when you need to interact with the subprocess while it runs,
+/// such as streaming its standard output, writing to its standard input, or sending
+/// signals. The closure runs concurrently with the subprocess and receives an
+/// ``Execution`` value you can use to access these capabilities.
+///
+/// The subprocess must terminate before this method returns.
+///
 /// - Parameters:
 ///   - executable: The executable to run.
 ///   - arguments: The arguments to pass to the executable.
@@ -110,16 +127,19 @@ public func run<
 ///   - workingDirectory: The working directory in which to run the executable.
 ///   - platformOptions: The platform-specific options to use when running the executable.
 ///   - input: The input to send to the executable.
-///   - output: How to manage executable standard output.
-///   - error: How to manage executable standard error.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
+///   - output: The method to use for redirecting standard output.
+///   - error: The method to use for redirecting standard error.
+///   - body: A closure that manages the running subprocess. The closure receives
+///     an ``Execution`` value that's valid only for the duration of the call.
+///     Don't let the execution value escape the closure.
+/// - Returns: An ``ExecutionResult`` that contains the closure's return value and
+///   the termination status of the subprocess.
+/// - Throws: A ``SubprocessError`` if the subprocess can't be launched, for
+///   example when the executable isn't found, or rethrows any error your
+///   `body` closure throws. A non-zero exit code is a normal result, not a
+///   thrown error; inspect ``ExecutionResult/terminationStatus`` instead.
 public func run<
-    Result,
+    Result: ~Copyable,
     Input: InputProtocol,
     Output: OutputProtocol,
     Error: ErrorOutputProtocol
@@ -129,115 +149,13 @@ public func run<
     environment: Environment = .inherit,
     workingDirectory: FilePath? = nil,
     platformOptions: PlatformOptions = PlatformOptions(),
-    input: Input = .none,
-    output: Output = .discarded,
-    error: Error = .discarded,
-    body: (_ execution: Execution) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Error.OutputType == Void {
-    let configuration = Configuration(
-        executable: executable,
-        arguments: arguments,
-        environment: environment,
-        workingDirectory: workingDirectory,
-        platformOptions: platformOptions
-    )
-    return try await run(
-        configuration,
-        input: input,
-        output: output,
-        error: error,
-        body: body
-    )
-}
-
-/// Runs an executable with given parameters and a custom closure to manage the
-/// running subprocess's lifetime and stream its standard output.
-/// - Parameters:
-///   - executable: The executable to run.
-///   - arguments: The arguments to pass to the executable.
-///   - environment: The environment in which to run the executable.
-///   - workingDirectory: The working directory in which to run the executable.
-///   - platformOptions: The platform-specific options to use when running the executable.
-///   - input: The input to send to the executable.
-///   - error: How to manage executable standard error.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard output stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - outputSequence: The standard output as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Input: InputProtocol, Error: ErrorOutputProtocol>(
-    _ executable: Executable,
-    arguments: Arguments = [],
-    environment: Environment = .inherit,
-    workingDirectory: FilePath? = nil,
-    platformOptions: PlatformOptions = PlatformOptions(),
-    input: Input = .none,
-    error: Error = .discarded,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ outputSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Error.OutputType == Void {
-    let configuration = Configuration(
-        executable: executable,
-        arguments: arguments,
-        environment: environment,
-        workingDirectory: workingDirectory,
-        platformOptions: platformOptions
-    )
-    return try await run(
-        configuration,
-        input: input,
-        error: error,
-        preferredBufferSize: preferredBufferSize,
-        body: body
-    )
-}
-
-/// Runs an executable with given parameters and a custom closure to manage the
-/// running subprocess's lifetime and stream its standard error.
-/// - Parameters:
-///   - executable: The executable to run.
-///   - arguments: The arguments to pass to the executable.
-///   - environment: The environment in which to run the executable.
-///   - workingDirectory: The working directory in which to run the executable.
-///   - platformOptions: The platform-specific options to use when running the executable.
-///   - input: The input to send to the executable.
-///   - output: How to manage executable standard output.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard error stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - errorSequence: The standard error as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Input: InputProtocol, Output: OutputProtocol>(
-    _ executable: Executable,
-    arguments: Arguments = [],
-    environment: Environment = .inherit,
-    workingDirectory: FilePath? = nil,
-    platformOptions: PlatformOptions = PlatformOptions(),
-    input: Input = .none,
+    input: Input,
     output: Output,
-    preferredBufferSize: Int? = nil,
+    error: Error,
     body: (
-        _ execution: Execution,
-        _ errorSequence: AsyncBufferSequence
+        Execution<Input, Output, Error>
     ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Output.OutputType == Void {
+) async throws -> ExecutionResult<Result, Output, Error> {
     let configuration = Configuration(
         executable: executable,
         arguments: arguments,
@@ -249,224 +167,25 @@ public func run<Result, Input: InputProtocol, Output: OutputProtocol>(
         configuration,
         input: input,
         output: output,
-        preferredBufferSize: preferredBufferSize,
-        body: body
-    )
-}
-
-/// Runs an executable with given parameters and a custom closure to manage the
-/// running subprocess's lifetime and stream its standard output and error.
-/// - Parameters:
-///   - executable: The executable to run.
-///   - arguments: The arguments to pass to the executable.
-///   - environment: The environment in which to run the executable.
-///   - workingDirectory: The working directory in which to run the executable.
-///   - platformOptions: The platform-specific options to use when running the executable.
-///   - input: The input to send to the executable.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard error stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - errorSequence: The standard error as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Input: InputProtocol>(
-    _ executable: Executable,
-    arguments: Arguments = [],
-    environment: Environment = .inherit,
-    workingDirectory: FilePath? = nil,
-    platformOptions: PlatformOptions = PlatformOptions(),
-    input: Input = .none,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ outputSequence: AsyncBufferSequence,
-        _ errorSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> {
-    let configuration = Configuration(
-        executable: executable,
-        arguments: arguments,
-        environment: environment,
-        workingDirectory: workingDirectory,
-        platformOptions: platformOptions
-    )
-    return try await run(
-        configuration,
-        input: input,
-        preferredBufferSize: preferredBufferSize,
-        body: body
-    )
-}
-
-/// Runs an executable with given parameters and a custom closure to manage the
-/// running subprocess's lifetime, write to its standard input, and stream its standard output.
-/// - Parameters:
-///   - executable: The executable to run.
-///   - arguments: The arguments to pass to the executable.
-///   - environment: The environment in which to run the executable.
-///   - workingDirectory: The working directory in which to run the executable.
-///   - platformOptions: The platform-specific options to use when running the executable.
-///   - error: How to manage executable standard error.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard output stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - inputWriter: A writer for the subprocess's standard input.
-///     - outputSequence: The standard output as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Error: ErrorOutputProtocol>(
-    _ executable: Executable,
-    arguments: Arguments = [],
-    environment: Environment = .inherit,
-    workingDirectory: FilePath? = nil,
-    platformOptions: PlatformOptions = PlatformOptions(),
-    error: Error = .discarded,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ inputWriter: StandardInputWriter,
-        _ outputSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Error.OutputType == Void {
-    let configuration = Configuration(
-        executable: executable,
-        arguments: arguments,
-        environment: environment,
-        workingDirectory: workingDirectory,
-        platformOptions: platformOptions
-    )
-    return try await run(
-        configuration,
         error: error,
-        preferredBufferSize: preferredBufferSize,
-        body: body
-    )
-}
-
-/// Runs an executable with given parameters and a custom closure to manage the
-/// running subprocess's lifetime, write to its standard input, and stream its standard error.
-/// - Parameters:
-///   - executable: The executable to run.
-///   - arguments: The arguments to pass to the executable.
-///   - environment: The environment in which to run the executable.
-///   - workingDirectory: The working directory in which to run the executable.
-///   - platformOptions: The platform-specific options to use when running the executable.
-///   - output: How to manage executable standard output.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard error stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - inputWriter: A writer for the subprocess's standard input.
-///     - errorSequence: The standard error as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Output: OutputProtocol>(
-    _ executable: Executable,
-    arguments: Arguments = [],
-    environment: Environment = .inherit,
-    workingDirectory: FilePath? = nil,
-    platformOptions: PlatformOptions = PlatformOptions(),
-    output: Output,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ inputWriter: StandardInputWriter,
-        _ errorSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Output.OutputType == Void {
-    let configuration = Configuration(
-        executable: executable,
-        arguments: arguments,
-        environment: environment,
-        workingDirectory: workingDirectory,
-        platformOptions: platformOptions
-    )
-    return try await run(
-        configuration,
-        output: output,
-        preferredBufferSize: preferredBufferSize,
-        body: body
-    )
-}
-
-/// Runs an executable with given parameters and a custom closure
-/// to manage the running subprocess’s lifetime, write to its
-/// standard input, and stream its standard output and standard error.
-/// - Parameters:
-///   - executable: The executable to run.
-///   - arguments: The arguments to pass to the executable.
-///   - environment: The environment in which to run the executable.
-///   - workingDirectory: The working directory in which to run the executable.
-///   - platformOptions: The platform-specific options to use when running the executable.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard output and error stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - inputWriter: A writer for the subprocess's standard input.
-///     - outputSequence: The standard output as an asynchronous sequence of buffers.
-///     - errorSequence: The standard error as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result>(
-    _ executable: Executable,
-    arguments: Arguments = [],
-    environment: Environment = .inherit,
-    workingDirectory: FilePath? = nil,
-    platformOptions: PlatformOptions = PlatformOptions(),
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ inputWriter: StandardInputWriter,
-        _ outputSequence: AsyncBufferSequence,
-        _ errorSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> {
-    let configuration = Configuration(
-        executable: executable,
-        arguments: arguments,
-        environment: environment,
-        workingDirectory: workingDirectory,
-        platformOptions: platformOptions
-    )
-    return try await run(
-        configuration,
-        preferredBufferSize: preferredBufferSize,
         body: body
     )
 }
 
 // MARK: - Configuration Based
 
-/// Runs a configuration asynchronously and returns
-/// an ``ExecutionRecord`` that contains the output of the child process.
+/// Runs a subprocess with the configuration you provide and returns the collected output and exit status.
+///
 /// - Parameters:
 ///   - configuration: The configuration to run.
 ///   - input: A span to write to the subprocess's standard input.
 ///   - output: The method to use for redirecting standard output.
 ///   - error: The method to use for redirecting standard error.
-/// - Returns: An ``ExecutionRecord`` that contains the result of the run.
+/// - Returns: An ``ExecutionResult`` that contains the result of the run.
+/// - Throws: A ``SubprocessError`` if the subprocess can't be launched, for
+///   example when the executable isn't found, or if the collected output
+///   exceeds the limit you set. A non-zero exit code is a normal result, not
+///   a thrown error; inspect ``ExecutionResult/terminationStatus`` instead.
 public func run<
     InputElement: BitwiseCopyable,
     Output: OutputProtocol,
@@ -476,57 +195,31 @@ public func run<
     input: borrowing Span<InputElement>,
     output: Output,
     error: Error = .discarded
-) async throws -> ExecutionRecord<Output, Error> {
-    typealias RunResult = (
-        processIdentifier: ProcessIdentifier,
-        standardOutput: Output.OutputType,
-        standardError: Error.OutputType
-    )
-
-    let customInput = CustomWriteInput()
-
-    let result = try await configuration.run(
-        input: try customInput.createPipe(),
-        output: try output.createPipe(),
-        error: try error.createPipe(),
-    ) { execution, inputIO, outputIO, errorIO in
-        var inputIOBox: IOChannel? = consume inputIO
-        var outputIOBox: IOChannel? = consume outputIO
-        var errorIOBox: IOChannel? = consume errorIO
-
-        // Write input, capture output and error in parallel
-        async let stdout = try output.captureOutput(from: outputIOBox.take())
-        async let stderr = try error.captureOutput(from: errorIOBox.take())
-        // Write span at the same isolation
-        if let writeFd = inputIOBox.take() {
-            let writer = StandardInputWriter(diskIO: writeFd)
-            _ = try await writer.write(input._bytes)
-            try await writer.finish()
-        }
-
-        return (
-            processIdentifier: execution.processIdentifier,
-            standardOutput: try await stdout,
-            standardError: try await stderr
-        )
+) async throws -> ExecutionResult<Void, Output, Error> {
+    let inputMethod = CustomWriteInput()
+    return try await run(
+        configuration,
+        input: inputMethod,
+        output: output,
+        error: error
+    ) { execution in
+        _ = try await execution.standardInputWriter.write(input.bytes)
+        try await execution.standardInputWriter.finish()
     }
-
-    return ExecutionRecord(
-        processIdentifier: result.value.processIdentifier,
-        terminationStatus: result.terminationStatus,
-        standardOutput: result.value.standardOutput,
-        standardError: result.value.standardError
-    )
 }
 
-/// Runs a ``Configuration`` asynchronously and returns
-/// an ``ExecutionRecord`` that contains the output of the child process.
+/// Runs a subprocess with the configuration you provide and returns the collected output and exit status.
+///
 /// - Parameters:
 ///   - configuration: The configuration to run.
 ///   - input: The input to send to the executable.
 ///   - output: The method to use for redirecting standard output.
 ///   - error: The method to use for redirecting standard error.
-/// - Returns: An ``ExecutionRecord`` that contains the result of the run.
+/// - Returns: An ``ExecutionResult`` that contains the result of the run.
+/// - Throws: A ``SubprocessError`` if the subprocess can't be launched, for
+///   example when the executable isn't found, or if the collected output
+///   exceeds the limit you set. A non-zero exit code is a normal result, not
+///   a thrown error; inspect ``ExecutionResult/terminationStatus`` instead.
 public func run<
     Input: InputProtocol,
     Output: OutputProtocol,
@@ -536,498 +229,224 @@ public func run<
     input: Input = .none,
     output: Output,
     error: Error = .discarded
-) async throws -> ExecutionRecord<Output, Error> {
-    typealias RunResult = (
-        processIdentifier: ProcessIdentifier,
-        standardOutput: Output.OutputType,
-        standardError: Error.OutputType
-    )
-    let inputPipe = try input.createPipe()
-    let outputPipe = try output.createPipe()
-    let errorPipe = try error.createPipe(from: outputPipe)
-
-    let result = try await configuration.run(
-        input: inputPipe,
-        output: outputPipe,
-        error: errorPipe
-    ) { execution, inputIO, outputIO, errorIO in
-        // Write input, capture output and error in parallel
-        var inputIOBox: IOChannel? = consume inputIO
-        var outputIOBox: IOChannel? = consume outputIO
-        var errorIOBox: IOChannel? = consume errorIO
-        return try await withThrowingTaskGroup(
-            of: OutputCapturingState<Output.OutputType, Error.OutputType>?.self,
-            returning: RunResult.self
-        ) { group in
-            var inputIOContainer: IOChannel? = inputIOBox.take()
-            var outputIOContainer: IOChannel? = outputIOBox.take()
-            var errorIOContainer: IOChannel? = errorIOBox.take()
-            group.addTask {
-                if let writeFd = inputIOContainer.take() {
-                    let writer = StandardInputWriter(diskIO: writeFd)
-                    try await input.write(with: writer)
-                    try await writer.finish()
-                }
-                return nil
-            }
-            group.addTask {
-                let stdout = try await output.captureOutput(
-                    from: outputIOContainer.take()
-                )
-                return .standardOutputCaptured(stdout)
-            }
-            group.addTask {
-                let stderr = try await error.captureOutput(
-                    from: errorIOContainer.take()
-                )
-                return .standardErrorCaptured(stderr)
-            }
-
-            do {
-                var stdout: Output.OutputType!
-                var stderror: Error.OutputType!
-                while let state = try await group.next() {
-                    switch state {
-                    case .standardOutputCaptured(let output):
-                        stdout = output
-                    case .standardErrorCaptured(let error):
-                        stderror = error
-                    case .none:
-                        continue
-                    }
-                }
-
-                return (
-                    processIdentifier: execution.processIdentifier,
-                    standardOutput: stdout,
-                    standardError: stderror
-                )
-            } catch {
-                if let underlying = error as? SubprocessError.UnderlyingError {
-                    throw SubprocessError.asyncIOFailed(
-                        reason: "Failed to capture output",
-                        underlyingError: underlying
-                    )
-                }
-                throw error
-            }
-        }
+) async throws -> ExecutionResult<Void, Output, Error> {
+    return try await run(configuration, input: input, output: output, error: error) { _ in
+        return () as Void
     }
-
-    return ExecutionRecord(
-        processIdentifier: result.value.processIdentifier,
-        terminationStatus: result.terminationStatus,
-        standardOutput: result.value.standardOutput,
-        standardError: result.value.standardError
-    )
 }
 
-/// Runs an executable with a given ``Configuration`` and a custom closure
-/// to manage the running subprocess's lifetime.
+/// Runs a subprocess with the configuration you provide and lets a closure interact with it while it runs.
+///
+/// Use this overload when you need to interact with the subprocess while it runs,
+/// such as streaming its standard output, writing to its standard input, or sending
+/// signals. The closure runs concurrently with the subprocess and receives an
+/// ``Execution`` value you can use to access these capabilities.
+///
+/// The subprocess must terminate before this method returns.
+///
 /// - Parameters:
 ///   - configuration: The configuration to run.
 ///   - input: The input to send to the executable.
-///   - output: How to manage executable standard output.
-///   - error: How to manage executable standard error.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
+///   - output: The method to use for redirecting standard output.
+///   - error: The method to use for redirecting standard error.
+///   - body: A closure that manages the running subprocess. The closure receives
+///     an ``Execution`` value that's valid only for the duration of the call.
+///     Don't let the execution value escape the closure.
+/// - Returns: An ``ExecutionResult`` that contains the closure's return value and
+///   the termination status of the subprocess.
+/// - Throws: A ``SubprocessError`` if the subprocess can't be launched, for
+///   example when the executable isn't found, or rethrows any error your
+///   `body` closure throws. A non-zero exit code is a normal result, not a
+///   thrown error; inspect ``ExecutionResult/terminationStatus`` instead.
 public func run<
-    Result,
+    Result: ~Copyable,
     Input: InputProtocol,
     Output: OutputProtocol,
     Error: ErrorOutputProtocol
 >(
     _ configuration: Configuration,
-    input: Input = .none,
-    output: Output = .discarded,
-    error: Error = .discarded,
-    body: (_ execution: Execution) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Error.OutputType == Void {
-    let inputPipe = try input.createPipe()
-    let outputPipe = try output.createPipe()
-    let errorPipe = try error.createPipe(from: outputPipe)
-
-    return try await configuration.run(
-        input: inputPipe,
-        output: outputPipe,
-        error: errorPipe
-    ) { execution, inputIO, outputIO, errorIO in
-        var inputIOBox: IOChannel? = consume inputIO
-        return try await withThrowingTaskGroup(
-            of: Void.self,
-            returning: Result.self
-        ) { group in
-            var inputIOContainer: IOChannel? = inputIOBox.take()
-            group.addTask {
-                if let inputIO = inputIOContainer.take() {
-                    let writer = StandardInputWriter(diskIO: inputIO)
-                    try await input.write(with: writer)
-                    try await writer.finish()
-                }
-            }
-
-            // Body runs in the same isolation
-            let result = try await body(execution)
-            try await group.waitForAll()
-            return result
-        }
-    }
-}
-
-/// Runs an executable with a given ``Configuration`` and a custom closure
-/// to manage the running subprocess's lifetime and stream its standard output.
-/// - Parameters:
-///   - configuration: The configuration to run.
-///   - input: The input to send to the executable.
-///   - error: How to manage executable standard error.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard output stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - outputSequence: The standard output as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<
-    Result,
-    Input: InputProtocol,
-    Error: ErrorOutputProtocol
->(
-    _ configuration: Configuration,
-    input: Input = .none,
-    error: Error = .discarded,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ outputSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Error.OutputType == Void {
-    let output = SequenceOutput()
-    let inputPipe = try input.createPipe()
-    let outputPipe = try output.createPipe()
-    let errorPipe = try error.createPipe(from: outputPipe)
-
-    return try await configuration.run(
-        input: inputPipe,
-        output: outputPipe,
-        error: errorPipe
-    ) { execution, inputIO, outputIO, errorIO in
-        var inputIOBox: IOChannel? = consume inputIO
-        var outputIOBox: IOChannel? = consume outputIO
-
-        return try await withThrowingTaskGroup(
-            of: Void.self,
-            returning: Result.self
-        ) { group in
-            var inputIOContainer: IOChannel? = inputIOBox.take()
-            group.addTask {
-                if let inputIO = inputIOContainer.take() {
-                    let writer = StandardInputWriter(diskIO: inputIO)
-                    try await input.write(with: writer)
-                    try await writer.finish()
-                }
-            }
-
-            // Body runs in the same isolation
-            let outputSequence = AsyncBufferSequence(
-                diskIO: outputIOBox.take()!.consumeIOChannel(),
-                preferredBufferSize: preferredBufferSize
-            )
-
-            let result = try await body(execution, outputSequence)
-            try await group.waitForAll()
-            return result
-        }
-    }
-}
-
-/// Runs an executable with a given ``Configuration`` and a custom closure
-/// to manage the running subprocess's lifetime and stream its standard error.
-/// - Parameters:
-///   - configuration: The configuration to run.
-///   - input: The input to send to the executable.
-///   - output: How to manage executable standard output.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard error stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - errorSequence: The standard error as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Input: InputProtocol, Output: OutputProtocol>(
-    _ configuration: Configuration,
-    input: Input = .none,
+    input: Input,
     output: Output,
-    preferredBufferSize: Int? = nil,
+    error: Error,
     body: (
-        _ execution: Execution,
-        _ errorSequence: AsyncBufferSequence
+        Execution<Input, Output, Error>
     ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Output.OutputType == Void {
-    let error = SequenceOutput()
-
-    return try await configuration.run(
-        input: try input.createPipe(),
-        output: try output.createPipe(),
-        error: try error.createPipe(),
-    ) { execution, inputIO, outputIO, errorIO in
-        var inputIOBox: IOChannel? = consume inputIO
-        var errorIOBox: IOChannel? = consume errorIO
-
-        return try await withThrowingTaskGroup(
-            of: Void.self,
-            returning: Result.self
-        ) { group in
-            var inputIOContainer: IOChannel? = inputIOBox.take()
-            group.addTask {
-                if let inputIO = inputIOContainer.take() {
-                    let writer = StandardInputWriter(diskIO: inputIO)
-                    try await input.write(with: writer)
-                    try await writer.finish()
-                }
-            }
-
-            // Body runs in the same isolation
-            let errorSequence = AsyncBufferSequence(
-                diskIO: errorIOBox.take()!.consumeIOChannel(),
-                preferredBufferSize: preferredBufferSize
-            )
-
-            let result = try await body(execution, errorSequence)
-            try await group.waitForAll()
-            return result
-        }
-    }
-}
-
-/// Runs an executable with a given ``Configuration`` and a custom closure
-/// to manage the running subprocess's lifetime and stream its standard output and error.
-/// - Parameters:
-///   - configuration: The configuration to run.
-///   - input: The input to send to the executable.
-///   - output: How to manage executable standard output.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard error stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - outputSequence: The standard output an asynchronous sequence of buffers.
-///     - errorSequence: The standard error as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Input: InputProtocol>(
-    _ configuration: Configuration,
-    input: Input = .none,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ outputSequence: AsyncBufferSequence,
-        _ errorSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> {
-    let output = SequenceOutput()
-    let error = SequenceOutput()
-
-    return try await configuration.run(
-        input: try input.createPipe(),
-        output: try output.createPipe(),
-        error: try error.createPipe(),
-    ) { execution, inputIO, outputIO, errorIO in
-        var inputIOBox: IOChannel? = consume inputIO
-        var outputIOBox: IOChannel? = consume outputIO
-        var errorIOBox: IOChannel? = consume errorIO
-
-        return try await withThrowingTaskGroup(
-            of: Void.self,
-            returning: Result.self
-        ) { group in
-            var inputIOContainer: IOChannel? = inputIOBox.take()
-            group.addTask {
-                if let inputIO = inputIOContainer.take() {
-                    let writer = StandardInputWriter(diskIO: inputIO)
-                    try await input.write(with: writer)
-                    try await writer.finish()
-                }
-            }
-
-            // Body runs in the same isolation
-            let outputSequence = AsyncBufferSequence(
-                diskIO: outputIOBox.take()!.consumeIOChannel(),
-                preferredBufferSize: preferredBufferSize
-            )
-
-            let errorSequence = AsyncBufferSequence(
-                diskIO: errorIOBox.take()!.consumeIOChannel(),
-                preferredBufferSize: preferredBufferSize
-            )
-
-            let result = try await body(execution, outputSequence, errorSequence)
-            try await group.waitForAll()
-            return result
-        }
-    }
-}
-
-/// Runs an executable with a given ``Configuration`` and a custom closure
-/// to manage the running subprocess's lifetime, write to its
-/// standard input, and stream its standard output.
-/// - Parameters:
-///   - configuration: The configuration to run.
-///   - error: How to manage executable standard error.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard output stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - inputWriter: A writer for the subprocess's standard input.
-///     - outputSequence: The standard output as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Error: ErrorOutputProtocol>(
-    _ configuration: Configuration,
-    error: Error = .discarded,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ inputWriter: StandardInputWriter,
-        _ outputSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Error.OutputType == Void {
-    let input = CustomWriteInput()
-    let output = SequenceOutput()
-    let inputPipe = try input.createPipe()
+) async throws -> ExecutionResult<Result, Output, Error> {
     let outputPipe = try output.createPipe()
     let errorPipe = try error.createPipe(from: outputPipe)
-
-    return try await configuration.run(
-        input: inputPipe,
+    let outcome: ExecutionOutcome<_RunOutcome<Result, Output, Error>> = try await configuration.run(
+        input: try input.createPipe(),
+        as: Input.self,
         output: outputPipe,
-        error: errorPipe
-    ) { execution, inputIO, outputIO, errorIO in
-        let writer = StandardInputWriter(diskIO: inputIO!)
-        let outputSequence = AsyncBufferSequence(
-            diskIO: outputIO!.consumeIOChannel(),
-            preferredBufferSize: preferredBufferSize
-        )
+        as: Output.self,
+        error: errorPipe,
+        as: Error.self
+    ) { processIdentifier, inputIO, outputIO, errorIO in
+        var inputIOBox = consume inputIO
+        var outputIOBox = consume outputIO
+        var errorIOBox = consume errorIO
 
-        return try await body(execution, writer, outputSequence)
+        // The body's (possibly noncopyable) result is moved out through this
+        // box. The task group returns only the captured output and error,
+        // because a noncopyable value can't be a `GroupResult`.
+        var resultBox: Result? = nil
+        let captured: (Output.OutputType, Error.OutputType) = try await withThrowingTaskGroup(
+            of: _RunGroupResult<Output, Error>.self,
+            returning: (Output.OutputType, Error.OutputType).self
+        ) { group in
+            var writer: StandardInputWriter?
+            if inputIOBox != nil {
+                let inputWriter = StandardInputWriter(
+                    diskIO: inputIOBox.take()!,
+                    processIdentifier: processIdentifier
+                )
+                writer = inputWriter
+
+                if Input.self != CustomWriteInput.self {
+                    // Write non-custom inputs in a parallel task.
+                    group.addTask {
+                        try await input.write(with: inputWriter)
+                        try await inputWriter.finish()
+                        return .inputWritten
+                    }
+                    // The input source can stall indefinitely. Wait for termination here and cancel
+                    // the group when the child exits. Output and error capture respond to cancellation
+                    // by draining whatever is still buffered and returning it, so nothing is truncated.
+                    group.addTask {
+                        _ = try? await waitForProcessTermination(for: processIdentifier)
+                        return .processTerminated
+                    }
+                }
+            }
+
+            var outputSequence: SubprocessOutputSequence? = nil
+            var errorSequence: SubprocessOutputSequence? = nil
+            // Capture output and error in parallel
+            if Output.self == SequenceOutput.self {
+                var diskIO = outputIOBox.take()
+                outputSequence = SubprocessOutputSequence(
+                    diskIO: diskIO!.consumeDescriptor(),
+                    processIdentifier: processIdentifier
+                )
+            } else if Output.OutputType.self == Void.self {
+                // No need to capture output
+                var diskIO = outputIOBox.take()
+                try diskIO?.safelyClose()
+            } else {
+                var diskIO = outputIOBox.take()
+                group.addTask {
+                    let result = try await output.captureOutput(
+                        from: diskIO.take(), for: processIdentifier
+                    )
+                    return .standardOutputCaptured(result)
+                }
+            }
+
+            if Error.self == SequenceOutput.self {
+                var diskIO = errorIOBox.take()
+                errorSequence = SubprocessOutputSequence(
+                    diskIO: diskIO!.consumeDescriptor(),
+                    processIdentifier: processIdentifier
+                )
+            } else if Error.OutputType.self == Void.self {
+                // No need to capture error
+                var diskIO = errorIOBox.take()
+                try diskIO?.safelyClose()
+            } else {
+                var diskIO = errorIOBox.take()
+                group.addTask {
+                    let result = try await error.captureOutput(
+                        from: diskIO.take(), for: processIdentifier
+                    )
+                    return .standardErrorCaptured(result)
+                }
+            }
+
+            let execution = Execution<Input, Output, Error>(
+                processIdentifier: processIdentifier,
+                inputWriter: writer,
+                outputStream: outputSequence,
+                errorStream: errorSequence
+            )
+            do {
+                resultBox = try await body(execution)
+            } catch {
+                // `execution` (and the `.sequence` streams it exposes) is only
+                // valid for the duration of `body`. Close its streams now,
+                // whether or not `body` fully drained them -- for example,
+                // by breaking out of a `for await` loop early -- so their
+                // underlying pipe descriptors aren't leaked. Not a `defer`:
+                // a future asynchronous close implementation needs an async
+                // context, which a `defer` body can't provide.
+                try? outputSequence?.close()
+                try? errorSequence?.close()
+                if Input.self == CustomWriteInput.self {
+                    try await writer?.finish()
+                }
+                throw error
+            }
+            try? outputSequence?.close()
+            try? errorSequence?.close()
+            if Input.self == CustomWriteInput.self {
+                try await writer?.finish()
+            }
+
+            var capturedOutput: Output.OutputType?
+            var capturedError: Error.OutputType?
+            while let groupResult = try await group.next() {
+                switch groupResult {
+                case .inputWritten:
+                    continue
+                case .processTerminated:
+                    // The child exited. Cancel any still-running tasks so the drain can complete.
+                    group.cancelAll()
+                case .standardOutputCaptured(let output):
+                    capturedOutput = output
+                case .standardErrorCaptured(let error):
+                    capturedError = error
+                }
+            }
+            if Output.OutputType.self == Void.self {
+                capturedOutput = (() as Any) as? Output.OutputType
+            }
+            if Error.OutputType.self == Void.self {
+                capturedError = (() as Any) as? Error.OutputType
+            }
+            return (capturedOutput!, capturedError!)
+        }
+        return _RunOutcome(
+            processIdentifier: processIdentifier,
+            closureResult: resultBox.take()!,
+            output: captured.0,
+            error: captured.1
+        )
     }
+
+    let terminationStatus = outcome.terminationStatus
+    let capturedResult = outcome.value
+    return ExecutionResult(
+        processIdentifier: capturedResult.processIdentifier,
+        terminationStatus: terminationStatus,
+        closureResult: capturedResult.closureResult,
+        standardOutput: capturedResult.output,
+        standardError: capturedResult.error
+    )
 }
 
-/// Runs an executable with a given ``Configuration`` and a custom closure
-/// to manage the running subprocess's lifetime, write to its
-/// standard input, and stream its standard error.
-/// - Parameters:
-///   - configuration: The configuration to run.
-///   - output: How to manage executable standard output.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard error stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - inputWriter: A writer for the subprocess's standard input.
-///     - errorSequence: The standard error as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result, Output: OutputProtocol>(
-    _ configuration: Configuration,
-    output: Output,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ inputWriter: StandardInputWriter,
-        _ errorSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> where Output.OutputType == Void {
-    let input = CustomWriteInput()
-    let error = SequenceOutput()
-
-    return try await configuration.run(
-        input: try input.createPipe(),
-        output: try output.createPipe(),
-        error: try error.createPipe(),
-    ) { execution, inputIO, outputIO, errorIO in
-        let writer = StandardInputWriter(diskIO: inputIO!)
-        let errorSequence = AsyncBufferSequence(
-            diskIO: errorIO!.consumeIOChannel(),
-            preferredBufferSize: preferredBufferSize
-        )
-        return try await body(execution, writer, errorSequence)
-    }
+private enum _RunGroupResult<Output: OutputProtocol, Error: OutputProtocol> {
+    case standardOutputCaptured(Output.OutputType)
+    case standardErrorCaptured(Error.OutputType)
+    case inputWritten
+    case processTerminated
 }
 
-/// Runs an executable with a given ``Configuration``
-/// and a custom closure to manage the running subprocess's lifetime, write to its
-/// standard input, and stream its standard output and standard error.
-/// - Parameters:
-///   - configuration: The configuration to run.
-///   - preferredBufferSize: The preferred size in bytes for the buffer used when reading
-///     from the subprocess's standard output and error stream. If `nil`, uses the system page size
-///     as the default buffer size. Larger buffer sizes may improve performance for
-///     subprocesses that produce large amounts of output, while smaller buffer sizes
-///     may reduce memory usage and improve responsiveness for interactive applications.
-///   - isolation: The isolation context to run the body closure.
-///   - body: A closure to manage the running process.
-///     All arguments passed to this closure are valid only for
-///     the duration of the closure's execution and must not be escaped.
-///     - execution: The running subprocess.
-///     - inputWriter: A writer for the subprocess's standard input.
-///     - outputSequence: The standard output as an asynchronous sequence of buffers.
-///     - errorSequence: The standard error as an asynchronous sequence of buffers.
-/// - Returns: An ``ExecutionOutcome`` that contains the closure's return value.
-public func run<Result>(
-    _ configuration: Configuration,
-    preferredBufferSize: Int? = nil,
-    body: (
-        _ execution: Execution,
-        _ inputWriter: StandardInputWriter,
-        _ outputSequence: AsyncBufferSequence,
-        _ errorSequence: AsyncBufferSequence
-    ) async throws -> Result
-) async throws -> ExecutionOutcome<Result> {
-    let input = CustomWriteInput()
-    let output = SequenceOutput()
-    let error = SequenceOutput()
-
-    return try await configuration.run(
-        input: try input.createPipe(),
-        output: try output.createPipe(),
-        error: try error.createPipe()
-    ) { execution, inputIO, outputIO, errorIO in
-        let writer = StandardInputWriter(diskIO: inputIO!)
-        let outputSequence = AsyncBufferSequence(
-            diskIO: outputIO!.consumeIOChannel(),
-            preferredBufferSize: preferredBufferSize
-        )
-        let errorSequence = AsyncBufferSequence(
-            diskIO: errorIO!.consumeIOChannel(),
-            preferredBufferSize: preferredBufferSize
-        )
-        return try await body(execution, writer, outputSequence, errorSequence)
-    }
+private struct _RunOutcome<
+    ClosureResult: Sendable & ~Copyable,
+    Output: OutputProtocol,
+    Error: OutputProtocol
+>: ~Copyable, Sendable {
+    let processIdentifier: ProcessIdentifier
+    let closureResult: ClosureResult
+    let output: Output.OutputType
+    let error: Error.OutputType
 }

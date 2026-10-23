@@ -9,20 +9,20 @@ var dep: [Package.Dependency] = [
         from: "1.5.0"
     )
 ]
-#if !os(Windows)
-dep.append(
-    .package(
-        url: "https://github.com/apple/swift-docc-plugin",
-        from: "1.4.5"
-    ),
+
+// SystemPackage is only used on non-Apple platforms; Apple platforms use the
+// System framework from the SDK (see `#if canImport(System)` in the sources).
+let systemPackageDependency: Target.Dependency = .product(
+    name: "SystemPackage",
+    package: "swift-system",
+    condition: .when(platforms: [.linux, .windows, .android, .wasi, .openbsd, .custom("freebsd")])
 )
-#endif
 
 // Enable SubprocessFoundation by default
 let defaultTraits: Set<String> = ["SubprocessFoundation"]
 
 let packageSwiftSettings: [SwiftSetting] = [
-    .define("SUBPROCESS_ASYNCIO_DISPATCH", .when(platforms: [.macOS, .custom("freebsd"), .openbsd])),
+    .define("SUBPROCESS_ASYNCIO_KQUEUE", .when(platforms: [.macOS, .custom("freebsd"), .openbsd])),
     .enableUpcomingFeature("ExistentialAny"),
     .enableUpcomingFeature("MemberImportVisibility"),
     .enableUpcomingFeature("InternalImportsByDefault"),
@@ -50,7 +50,7 @@ let package = Package(
             name: "Subprocess",
             dependencies: [
                 "_SubprocessCShims",
-                .product(name: "SystemPackage", package: "swift-system"),
+                systemPackageDependency,
             ],
             path: "Sources/Subprocess",
             exclude: ["CMakeLists.txt"],
@@ -66,17 +66,18 @@ let package = Package(
                 "_SubprocessCShims",
                 "Subprocess",
                 "TestResources",
-                .product(name: "SystemPackage", package: "swift-system"),
+                systemPackageDependency,
             ],
-            swiftSettings: [
-                .enableExperimentalFeature("Span")
-            ] + packageSwiftSettings
+            swiftSettings: packageSwiftSettings,
+            linkerSettings: [
+                .linkedLibrary("util", .when(platforms: [.openbsd])) // for openpty
+            ]
         ),
 
         .target(
             name: "TestResources",
             dependencies: [
-                .product(name: "SystemPackage", package: "swift-system")
+                systemPackageDependency
             ],
             path: "Tests/TestResources",
             resources: [
@@ -88,7 +89,12 @@ let package = Package(
         .target(
             name: "_SubprocessCShims",
             path: "Sources/_SubprocessCShims",
-            exclude: ["CMakeLists.txt"]
+            exclude: ["CMakeLists.txt"],
+            linkerSettings: [
+                // For dlsym, used to detect posix_spawn file actions that some
+                // libc versions lack.
+                .linkedLibrary("dl", .when(platforms: [.linux, .android]))
+            ]
         ),
     ]
 )

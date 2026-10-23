@@ -28,7 +28,6 @@ import WinSDK
 #endif
 
 import Testing
-import Dispatch
 import Foundation
 import TestResources
 import _SubprocessCShims
@@ -39,7 +38,7 @@ struct SubprocessProcessMonitoringTests {
 
     init() {
         _ = globallyIgnoredSIGPIPE
-        #if os(Linux) || os(Android)
+        #if !os(Windows)
         _setupMonitorSignalHandler()
         #endif
     }
@@ -102,7 +101,7 @@ struct SubprocessProcessMonitoringTests {
 
     private func withSpawnedExecution(
         config: Configuration,
-        _ body: (Execution) async throws -> Void
+        _ body: (Execution<NoInput, DiscardedOutput, DiscardedOutput>) async throws -> Void
     ) async throws {
         let spawnResult = try await config.spawn(
             withInput: self.devNullInputPipe(),
@@ -110,9 +109,15 @@ struct SubprocessProcessMonitoringTests {
             errorPipe: self.devNullOutputPipe()
         )
         defer {
-            spawnResult.execution.processIdentifier.close()
+            spawnResult.processIdentifier.close()
         }
-        try await body(spawnResult.execution)
+        let execution = Execution<NoInput, DiscardedOutput, DiscardedOutput>(
+            processIdentifier: spawnResult.processIdentifier,
+            inputWriter: nil,
+            outputStream: nil,
+            errorStream: nil
+        )
+        try await body(execution)
     }
 }
 
@@ -143,7 +148,7 @@ extension SubprocessProcessMonitoringTests {
     #if !os(Windows)
     @Test func testExitViaSignal() async throws {
         let config = Configuration(
-            executable: .path("/usr/bin/tail"),
+            executable: .name("tail"),
             arguments: ["-f", "/dev/null"]
         )
         try await withSpawnedExecution(config: config) { execution in
@@ -200,9 +205,12 @@ extension SubprocessProcessMonitoringTests {
 
     @Test func testInvalidProcessIdentifier() async throws {
         #if os(Windows)
-        let underlying = SubprocessError.WindowsError(rawValue: DWORD(ERROR_INVALID_PARAMETER))
+        let underlying = SubprocessError.WindowsError(win32Error: DWORD(ERROR_INVALID_PARAMETER))
         let processIdentifier = ProcessIdentifier(
-            value: .max, processDescriptor: INVALID_HANDLE_VALUE, threadHandle: INVALID_HANDLE_VALUE
+            value: .max,
+            processDescriptor: INVALID_HANDLE_VALUE,
+            threadHandle: INVALID_HANDLE_VALUE,
+            jobHandle: INVALID_HANDLE_VALUE
         )
         #elseif os(Linux) || os(Android) || os(FreeBSD) || os(OpenBSD)
         let underlying = Errno(rawValue: ECHILD)
@@ -221,7 +229,8 @@ extension SubprocessProcessMonitoringTests {
         }
     }
 
-    @Test func testDoesNotReapUnrelatedChildProcess() async throws {
+    @Test(.timeLimit(.minutes(1)))
+    func testDoesNotReapUnrelatedChildProcess() async throws {
         // Make sure we don't reap child exit status that we didn't spawn
         let child1 = self.immediateExitProcess(withExitCode: 0)
         let child2 = self.immediateExitProcess(withExitCode: 0)
@@ -288,6 +297,39 @@ extension SubprocessProcessMonitoringTests {
         }
     }
 
+    @Test func testCanMonitorSameProcessConcurrently() async throws {
+        // Multiple tasks waiting on the *same* process must all observe its
+        // termination. This is the idempotency contract of
+        // waitForProcessTermination: registering the same process for
+        // monitoring more than once concurrently must succeed on every
+        // platform. (On Linux >= 5.4 this specifically guards against
+        // double-registering the pidfd with epoll, which fails with EEXIST.)
+        let waiterCount = 10
+        // Keep the child alive long enough that every waiter registers
+        // before it exits, so the concurrent-registration path is exercised.
+        let config = self.longRunningProcess(withTimeOutSeconds: 1)
+        try await withSpawnedExecution(config: config) { execution in
+            try await withThrowingTaskGroup { group in
+                for _ in 0..<waiterCount {
+                    group.addTask {
+                        // Call the monitoring primitive directly instead of
+                        // monitorProcessTermination: the zombie must be reaped
+                        // exactly once, so we reap only after every waiter has
+                        // observed termination.
+                        try await waitForProcessTermination(
+                            for: execution.processIdentifier
+                        )
+                    }
+                }
+
+                try await group.waitForAll()
+            }
+            // Every waiter resumed without error; reap the process once.
+            let status = try reapProcess(with: execution.processIdentifier)
+            #expect(status.isSuccess)
+        }
+    }
+
     @Test func testExitSignalCoalescing() async throws {
         // Spawn many immediately exit processes in a row to trigger
         // signal coalescing. Make sure we can handle this
@@ -307,7 +349,7 @@ extension SubprocessProcessMonitoringTests {
                 outputPipe: self.devNullOutputPipe(),
                 errorPipe: self.devNullOutputPipe()
             )
-            spawnedProcesses.append(spawnResult.execution.processIdentifier)
+            spawnedProcesses.append(spawnResult.processIdentifier)
         }
 
         try await withThrowingTaskGroup { group in
@@ -321,4 +363,9 @@ extension SubprocessProcessMonitoringTests {
             try await group.waitForAll()
         }
     }
+}
+
+internal func monitorProcessTermination(for processIdentifier: ProcessIdentifier) async throws -> TerminationStatus {
+    try await waitForProcessTermination(for: processIdentifier)
+    return try reapProcess(with: processIdentifier)
 }

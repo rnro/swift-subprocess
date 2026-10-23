@@ -17,10 +17,17 @@ import System
 import SystemPackage
 #endif
 
+#if os(OpenBSD)
+// FIXME: Why is this necessary only on OpenBSD?
+public import _SubprocessCShims
+#else
 import _SubprocessCShims
+#endif
 
 #if canImport(Darwin)
-import Darwin
+// `public` because `ProcessIdentifier.value` below is public and typed `pid_t`.
+// `Subprocess+Darwin.swift` imports Darwin publicly for the same reason.
+public import Darwin
 #elseif canImport(Android)
 public import Android
 #elseif canImport(Glibc)
@@ -28,8 +35,6 @@ public import Glibc
 #elseif canImport(Musl)
 public import Musl
 #endif
-
-@preconcurrency internal import Dispatch
 
 // MARK: - Signals
 
@@ -39,7 +44,7 @@ public struct Signal: Hashable, Sendable {
     /// The underlying platform-specific value for the signal.
     public let rawValue: Int32
 
-    private init(rawValue: Int32) {
+    public init(rawValue: Int32) {
         self.rawValue = rawValue
     }
 
@@ -48,9 +53,11 @@ public struct Signal: Hashable, Sendable {
     /// the process.
     public static var interrupt: Self { .init(rawValue: SIGINT) }
     /// The `.terminate` signal is sent to a process to request its
-    /// termination. Unlike the `.kill` signal, it can be caught
+    /// termination.
+    ///
+    /// Unlike the `.kill` signal, it can be caught
     /// and interpreted or ignored by the process. This allows
-    /// the process to perform nice termination releasing resources
+    /// the process to perform graceful termination releasing resources
     /// and saving state if appropriate. `.interrupt` is nearly
     /// identical to `.terminate`.
     public static var terminate: Self { .init(rawValue: SIGTERM) }
@@ -62,13 +69,17 @@ public struct Signal: Hashable, Sendable {
     /// `.suspend` signal.
     public static var resume: Self { .init(rawValue: SIGCONT) }
     /// The `.kill` signal is sent to a process to cause it to
-    /// terminate immediately (kill). In contrast to `.terminate`
+    /// terminate immediately.
+    ///
+    /// In contrast to `.terminate`
     /// and `.interrupt`, this signal cannot be caught or ignored,
     /// and the receiving process cannot perform any
     /// clean-up upon receiving this signal.
     public static var kill: Self { .init(rawValue: SIGKILL) }
     /// The `.terminalClosed` signal is sent to a process when
-    /// its controlling terminal is closed. In modern systems,
+    /// its controlling terminal is closed.
+    ///
+    /// In modern systems,
     /// this signal usually means that the controlling pseudo
     /// or virtual terminal has been closed.
     public static var terminalClosed: Self { .init(rawValue: SIGHUP) }
@@ -91,13 +102,13 @@ public struct Signal: Hashable, Sendable {
 }
 
 extension Execution {
-    /// Sends the given signal to the child process.
+    /// Sends the signal you provide to the subprocess.
     /// - Parameters:
     ///   - signal: The signal to send.
-    ///   - shouldSendToProcessGroup: Whether this signal should be sent to
+    ///   - shouldSendToProcessGroup: A Boolean value that indicates whether this signal should be sent to
     ///     the entire process group.
-    /// - Throws: `SubprocessError` with error code `.processControlFailed`.
-    ///     See `.underlyingError` for more details.
+    /// - Throws: ``SubprocessError`` with error code ``SubprocessError/Code/processControlFailed``.
+    ///     See ``SubprocessError/underlyingError`` for more details.
     public func send(
         signal: Signal,
         toProcessGroup shouldSendToProcessGroup: Bool = false
@@ -114,7 +125,7 @@ extension Execution {
 
         #if os(Linux) || os(Android) || os(FreeBSD)
         // On platforms with process descriptors, use _subprocess_pdkill if possible
-        if shouldSendToProcessGroup || self.processIdentifier.processDescriptor < 0 {
+        if shouldSendToProcessGroup || self.processIdentifier.processDescriptor == .invalidDescriptor {
             // _subprocess_pdkill does not support sending signal to process group
             try _kill(pid, signal: signal)
         } else {
@@ -144,14 +155,20 @@ extension Execution {
     }
 }
 
-// MARK: - Environment Resolution
+// MARK: - Environment Resolution and Validation
 extension Environment {
+    /// The `PATH` value to resolve ``Executable/name(_:)`` against.
+    ///
+    /// The value the subprocess receives wins, so a name resolves in the
+    /// environment it will run in. When that environment carries no `PATH`,
+    /// this process's own value is used; `nil` means neither defines one.
     internal func pathValue() -> String? {
         switch self.config {
         case .inherit(let overrides):
-            // If PATH value exists in overrides, use it
-            if let value = overrides[.path] {
-                return value
+            // If PATH value exists in overrides, use it. An override maps to
+            // `nil` to unset the value, which falls through to this process.
+            if let overridden = overrides[.path], let overridden {
+                return overridden
             }
             // Fall back to current process
             return Self.currentEnvironmentValues()[.path]
@@ -159,7 +176,7 @@ extension Environment {
             if let value = fullEnvironment[.path] {
                 return value
             }
-            return nil
+            return Self.currentEnvironmentValues()[.path]
         case .rawBytes(let rawBytesArray):
             let needle: [UInt8] = Array("\(Key.path.rawValue)=".utf8)
             for row in rawBytesArray {
@@ -170,7 +187,7 @@ extension Environment {
                 let pathValue = row.dropFirst(needle.count)
                 return String(decoding: pathValue, as: UTF8.self)
             }
-            return nil
+            return Self.currentEnvironmentValues()[.path]
         }
     }
 
@@ -251,6 +268,84 @@ extension Environment {
         defer { values.forEach { free($0) } }
         return body(values)
     }
+
+    /// POSIX standard imposes restrictions on environment keys and values:
+    /// 1. Names shall not contain the character '='.
+    /// 2. Names shall not begin with a digit.
+    /// 3. Names and values shall be composed of characters from the portable character set except NUL
+    /// See https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap08.html
+    internal func validate() throws(SubprocessError) {
+        let equals = UInt8(ascii: "=")
+        let nul = UInt8(ascii: "\0")
+        let digit0 = UInt8(ascii: "0")
+        let digit9 = UInt8(ascii: "9")
+
+        func _validateError(_ reason: String) -> SubprocessError {
+            return .spawnFailed(withUnderlyingError: nil, reason: reason)
+        }
+
+        func _validate(_ dict: [Key: String?]) throws(SubprocessError) {
+            for (key, value) in dict {
+                let keyBytes = key.rawValue.utf8
+                // Rule 1/3: key shall not contain = nor null bytes
+                let ruleOneViolation = keyBytes.contains {
+                    $0 == equals || $0 == nul
+                }
+                if ruleOneViolation {
+                    throw _validateError("Environment key '\(key)' must not contain '=' or null bytes.")
+                }
+                // Rule 2: key shall not begin with a digit
+                if let first = keyBytes.first, (digit0...digit9).contains(first) {
+                    throw _validateError("Environment key '\(key)' must not begin with a digit.")
+                }
+                // Rule 3: value shall not contain null bytes
+                if let value, value.utf8.contains(nul) {
+                    throw _validateError("Environment value '\(value)' must not contain null bytes.")
+                }
+            }
+        }
+
+        func _validate(rawBytes rawBytesArray: [[UInt8]]) throws(SubprocessError) {
+            for rawBytes in rawBytesArray {
+                // Each entry is passed to `strdup` in `createEnv()`, which stops
+                // at the first null byte. A single trailing null terminator is
+                // allowed, but reject any earlier null byte since it would
+                // silently truncate the entry.
+                var bytes = rawBytes
+                if bytes.last == nul {
+                    bytes = bytes.dropLast()
+                }
+                // Rule 1/3: entry shall not contain null bytes
+                if bytes.contains(nul) {
+                    throw _validateError(
+                        "Environment entry '\(String(decoding: bytes, as: UTF8.self))' must not contain null bytes."
+                    )
+                }
+                // Each entry is a key and value pair joined by '='
+                guard let equalsIndex = bytes.firstIndex(of: equals) else {
+                    throw _validateError(
+                        "Environment entry '\(String(decoding: bytes, as: UTF8.self))' must contain '='."
+                    )
+                }
+                // Rule 2: key shall not begin with a digit
+                let keyBytes = bytes[bytes.startIndex..<equalsIndex]
+                if let first = keyBytes.first, (digit0...digit9).contains(first) {
+                    throw _validateError(
+                        "Environment key '\(String(decoding: keyBytes, as: UTF8.self))' must not begin with a digit."
+                    )
+                }
+            }
+        }
+
+        switch self.config {
+        case .inherit(let updates):
+            try _validate(updates)
+        case .custom(let custom):
+            try _validate(custom.mapValues { Optional($0) })
+        case .rawBytes(let rawBytesArray):
+            try _validate(rawBytes: rawBytesArray)
+        }
+    }
 }
 
 // MARK: Args Creation
@@ -272,7 +367,26 @@ extension Arguments {
 
 // MARK: -  Executable Searching
 extension Executable {
-    internal static let defaultSearchPaths = [
+    /// The directories searched when neither the environment passed to the
+    /// subprocess nor the current process defines `PATH`. This is the system's own
+    /// standard path,`confstr(_CS_PATH)`, falling back to the `<paths.h>` macro fixed
+    /// at compile time.
+    ///
+    /// The list is filtered like a `PATH` value, so a relative or empty entry in
+    /// the system's answer is skipped too. If the system reports nothing usable,
+    /// the historical hard-coded list stands in as a last resort.
+    internal static let defaultSearchPaths: [String] = {
+        guard let systemPathValue = Self.systemStandardPathValue() else {
+            return Self.fallbackSearchPaths
+        }
+        let searchPaths = systemPathValue.split(separator: Self.pathValueSeparator)
+            .map(String.init)
+            .filter { FilePath($0).isAbsolute }
+        return searchPaths.isEmpty ? Self.fallbackSearchPaths : searchPaths
+    }()
+
+    /// The directories to search when the system reports no standard path.
+    private static let fallbackSearchPaths = [
         "/usr/bin",
         "/bin",
         "/usr/sbin",
@@ -280,15 +394,31 @@ extension Executable {
         "/usr/local/bin",
     ]
 
+    /// Asks the system for its standard `PATH` value, or returns `nil` when it
+    /// reports none.
+    private static func systemStandardPathValue() -> String? {
+        // Two-call `confstr` protocol: size the buffer, then fill it. A second
+        // call that needs more room than the first reported means the value
+        // changed underneath us, which cannot happen for a system constant, so
+        // a short answer is simply used as-is.
+        let size = _subprocess_default_search_path(nil, 0)
+        guard size > 1 else {
+            return nil
+        }
+        let pathValue = withUnsafeTemporaryAllocation(of: CChar.self, capacity: Int(size)) { buffer in
+            guard _subprocess_default_search_path(buffer.baseAddress, size) > 0 else {
+                return ""
+            }
+            return String(cString: buffer.baseAddress!)
+        }
+        return pathValue.isEmpty ? nil : pathValue
+    }
+
     internal func resolveExecutablePath(withPathValue pathValue: String?) throws(SubprocessError) -> String {
         switch self.storage {
         case .executable(let executableName):
-            // If the executableName in is already a full path, return it directly
-            if Configuration.pathAccessible(executableName, mode: X_OK) {
-                return executableName
-            }
-            let firstAccessibleExecutable = possibleExecutablePaths(withPathValue: pathValue)
-                .first { Configuration.pathAccessible($0, mode: X_OK) }
+            let firstAccessibleExecutable = try possibleExecutablePaths(withPathValue: pathValue)
+                .first { Configuration.executableAccessible($0) }
             if let firstAccessibleExecutable {
                 return firstAccessibleExecutable
             }
@@ -299,22 +429,20 @@ extension Executable {
         }
     }
 
+    /// The paths to try, in order, for this executable.
+    ///
+    /// A name is joined to each directory returned by
+    /// `Executable.searchPaths(withPathValue:)`; the name itself is never a
+    /// candidate, so `execvp`-style resolution against a current working
+    /// directory cannot happen. A path is its own only candidate.
     internal func possibleExecutablePaths(
         withPathValue pathValue: String?
-    ) -> _OrderedSet<String> {
+    ) throws(SubprocessError) -> _OrderedSet<String> {
         switch self.storage {
         case .executable(let executableName):
+            try Self.validate(name: executableName)
             var results: _OrderedSet<String> = .init()
-            // executableName could be a full path
-            results.insert(executableName)
-            // Get $PATH from environment
-            let searchPaths =
-                if let pathValue = pathValue {
-                    pathValue.split(separator: ":").map { String($0) } + Self.defaultSearchPaths
-                } else {
-                    Self.defaultSearchPaths
-                }
-            for path in searchPaths {
+            for path in Self.searchPaths(withPathValue: pathValue) {
                 results.insert(
                     FilePath(path).appending(executableName).string
                 )
@@ -339,6 +467,8 @@ extension Configuration {
         _ work: (PreSpawnArgs) async throws -> Result
     ) async throws -> Result {
         // Prepare environment
+        try self.environment.validate()
+
         let env = self.environment.createEnv()
         defer {
             for ptr in env { ptr?.deallocate() }
@@ -379,16 +509,88 @@ extension Configuration {
             return access($0, mode) == 0
         }
     }
+
+    /// Returns whether `path` refers to a regular file this process may execute.
+    ///
+    /// `access(_:X_OK)` alone is not enough: on a directory the execute bit
+    /// means "searchable", so a directory would otherwise be reported as a
+    /// runnable executable.
+    internal static func executableAccessible(_ path: String) -> Bool {
+        guard Self.pathAccessible(path, mode: X_OK) else {
+            return false
+        }
+        var status = stat()
+        guard path.withCString({ stat($0, &status) == 0 }) else {
+            return false
+        }
+        // Convert the constants to `st_mode`'s own type rather than assuming it
+        // is `mode_t`: on 32-bit Android `st_mode` is `UInt32` but `mode_t` is
+        // `UInt16`.
+        return (status.st_mode & numericCast(S_IFMT)) == numericCast(S_IFREG)
+    }
 }
 
 // MARK: - FileDescriptor extensions
 extension FileDescriptor {
+    /// Creates a pipe, marking both ends close-on-exec atomically where the
+    /// platform/OS combination supports it (via `pipe2(2)`), so a `fork()`
+    /// racing on another thread cannot inherit the new descriptors into an
+    /// unrelated spawned child. Falls back to `pipe()` followed by
+    /// `fcntl(F_SETFD, FD_CLOEXEC)` where the atomic primitive isn't
+    /// available.
+    ///
+    /// The end(s) of this pipe handed to a spawned child remain usable by
+    /// it: the `dup2`/`posix_spawn_file_actions_adddup2` call that binds one
+    /// end to the child's stdin/stdout/stderr always clears close-on-exec on
+    /// the resulting descriptor, regardless of the source descriptor's own
+    /// close-on-exec state.
+    ///
+    /// The corresponding C function is `pipe2`.
+    internal static func cloexecPipe() throws -> (
+        readEnd: FileDescriptor,
+        writeEnd: FileDescriptor
+    ) {
+        var fds: (Int32, Int32) = (-1, -1)
+        let rc = withUnsafeMutablePointer(to: &fds) { pointer in
+            pointer.withMemoryRebound(to: Int32.self, capacity: 2) { fds in
+                _subprocess_pipe_cloexec(fds)
+            }
+        }
+        guard rc == 0 else {
+            throw Errno(rawValue: errno)
+        }
+        return (readEnd: FileDescriptor(rawValue: fds.0), writeEnd: FileDescriptor(rawValue: fds.1))
+    }
+
+    /// Duplicates this file descriptor onto the lowest-numbered unused
+    /// descriptor, marking the new descriptor close-on-exec.
+    ///
+    /// Implemented with `fcntl(F_DUPFD_CLOEXEC)`, which atomically obtains
+    /// the new descriptor and marks it close-on-exec in one syscall: a plain
+    /// `dup()` followed by a separate `fcntl(F_SETFD, FD_CLOEXEC)` could
+    /// race a `fork()` on another thread, which could inherit the new
+    /// descriptor into an unrelated spawned child before this thread gets a
+    /// chance to mark it close-on-exec.
+    internal func safeDuplicate(retryOnInterrupt: Bool = true) throws -> FileDescriptor {
+        while true {
+            let newValue = _subprocess_dup_cloexec(self.rawValue)
+            if newValue >= 0 {
+                return FileDescriptor(rawValue: newValue)
+            }
+            let currentError = Errno(rawValue: errno)
+            if retryOnInterrupt && currentError == .interrupted {
+                continue
+            }
+            throw currentError
+        }
+    }
+
     internal static func ssp_pipe() throws(SubprocessError) -> (
         readEnd: FileDescriptor,
         writeEnd: FileDescriptor
     ) {
         do {
-            return try pipe()
+            return try cloexecPipe()
         } catch {
             throw SubprocessError.asyncIOFailed(
                 reason: "Failed to create pipe",
@@ -404,7 +606,50 @@ extension FileDescriptor {
 
 internal typealias PlatformFileDescriptor = CInt
 
-// MARK: - Spawning
+internal extension PlatformFileDescriptor {
+    static var invalidDescriptor: Self { -1 }
+}
+
+// MARK:  - ProcessIdentifier
+
+/// A platform-independent identifier for a subprocess.
+public struct ProcessIdentifier: Sendable, Hashable {
+    /// The platform-specific process identifier value.
+    public let value: pid_t
+
+    #if os(Linux) || os(Android) || os(FreeBSD)
+    /// The process file descriptor (pidfd) for the running execution.
+    ///
+    /// `-1` when this platform provides no way to obtain one for how the process
+    /// was launched. On FreeBSD that is the case for any process launched with
+    /// `posix_spawn`, which is the common path: a process descriptor is
+    /// available there only from `pdfork`, which only the `fork`/`exec` fallback
+    /// path uses.
+    public let processDescriptor: CInt
+    #else
+    internal let processDescriptor: CInt // not used on other platforms
+    #endif
+
+    internal init(value: pid_t, processDescriptor: PlatformFileDescriptor) {
+        self.value = value
+        self.processDescriptor = processDescriptor
+    }
+
+    internal func close() {
+        if self.processDescriptor != .invalidDescriptor {
+            try? _safelyClose(.fileDescriptor(FileDescriptor(rawValue: self.processDescriptor)))
+        }
+    }
+}
+
+extension ProcessIdentifier: CustomStringConvertible, CustomDebugStringConvertible {
+    /// A textual representation of the process identifier.
+    public var description: String { "\(self.value)" }
+    /// A debug-oriented textual representation of the process identifier.
+    public var debugDescription: String { "\(self.value)" }
+}
+
+// MARK: - Platform Types
 
 #if !canImport(Darwin)
 
@@ -422,211 +667,6 @@ public typealias uid_t = Musl.uid_t
 public typealias gid_t = Musl.gid_t
 #endif
 
-extension Configuration {
-
-    // @unchecked Sendable because we need to capture UnsafePointers
-    // to send to another thread. While UnsafePointers are not
-    // Sendable, we are not mutating them -- we only need these type
-    // for C interface.
-    internal struct SpawnContext: @unchecked Sendable {
-        let argv: [UnsafeMutablePointer<CChar>?]
-        let env: [UnsafeMutablePointer<CChar>?]
-        let uidPtr: UnsafeMutablePointer<uid_t>?
-        let gidPtr: UnsafeMutablePointer<gid_t>?
-        let processGroupIDPtr: UnsafeMutablePointer<gid_t>?
-    }
-
-    internal func spawn(
-        withInput inputPipe: consuming CreatedPipe,
-        outputPipe: consuming CreatedPipe,
-        errorPipe: consuming CreatedPipe
-    ) async throws -> SpawnResult {
-        // Ensure the waiter thread is running.
-        #if os(Linux) || os(Android)
-        _setupMonitorSignalHandler()
-        #endif
-
-        // Instead of checking if every possible executable path
-        // is valid, spawn each directly and catch ENOENT
-        let possiblePaths = self.executable.possibleExecutablePaths(
-            withPathValue: self.environment.pathValue()
-        )
-        var inputPipeBox: CreatedPipe? = consume inputPipe
-        var outputPipeBox: CreatedPipe? = consume outputPipe
-        var errorPipeBox: CreatedPipe? = consume errorPipe
-
-        return try await self.preSpawn { args throws -> SpawnResult in
-            let (env, uidPtr, gidPtr, supplementaryGroups) = args
-
-            var _inputPipe = inputPipeBox.take()!
-            var _outputPipe = outputPipeBox.take()!
-            var _errorPipe = errorPipeBox.take()!
-
-            let inputReadFileDescriptor: IODescriptor? = _inputPipe.readFileDescriptor()
-            let inputWriteFileDescriptor: IODescriptor? = _inputPipe.writeFileDescriptor()
-            let outputReadFileDescriptor: IODescriptor? = _outputPipe.readFileDescriptor()
-            let outputWriteFileDescriptor: IODescriptor? = _outputPipe.writeFileDescriptor()
-            let errorReadFileDescriptor: IODescriptor? = _errorPipe.readFileDescriptor()
-            let errorWriteFileDescriptor: IODescriptor? = _errorPipe.writeFileDescriptor()
-
-            for possibleExecutablePath in possiblePaths {
-                var processGroupIDPtr: UnsafeMutablePointer<gid_t>? = nil
-                if let processGroupID = self.platformOptions.processGroupID {
-                    processGroupIDPtr = .allocate(capacity: 1)
-                    processGroupIDPtr?.pointee = gid_t(processGroupID)
-                }
-                // Setup Arguments
-                let argv: [UnsafeMutablePointer<CChar>?] = self.arguments.createArgs(
-                    withExecutablePath: possibleExecutablePath
-                )
-                defer {
-                    for ptr in argv { ptr?.deallocate() }
-                }
-                // Setup input
-                let fileDescriptors: [CInt] = [
-                    inputReadFileDescriptor?.platformDescriptor() ?? -1,
-                    inputWriteFileDescriptor?.platformDescriptor() ?? -1,
-                    outputWriteFileDescriptor?.platformDescriptor() ?? -1,
-                    outputReadFileDescriptor?.platformDescriptor() ?? -1,
-                    errorWriteFileDescriptor?.platformDescriptor() ?? -1,
-                    errorReadFileDescriptor?.platformDescriptor() ?? -1,
-                ]
-
-                // Spawn
-                let spawnContext = SpawnContext(
-                    argv: argv, env: env, uidPtr: uidPtr, gidPtr: gidPtr, processGroupIDPtr: processGroupIDPtr
-                )
-                let (pid, processDescriptor, spawnError) = try await runOnBackgroundThread { () throws(SubprocessError) in
-                    return try possibleExecutablePath._withCString { exePath throws(SubprocessError) in
-                        return try (self.workingDirectory?.string).withOptionalCString { workingDir in
-                            return supplementaryGroups.withOptionalUnsafeBufferPointer { sgroups in
-                                return fileDescriptors.withUnsafeBufferPointer { fds in
-                                    var pid: pid_t = 0
-                                    var processDescriptor: PlatformFileDescriptor = -1
-
-                                    let rc = _subprocess_fork_exec(
-                                        &pid,
-                                        &processDescriptor,
-                                        exePath,
-                                        workingDir,
-                                        fds.baseAddress!,
-                                        spawnContext.argv,
-                                        spawnContext.env,
-                                        spawnContext.uidPtr,
-                                        spawnContext.gidPtr,
-                                        spawnContext.processGroupIDPtr,
-                                        CInt(supplementaryGroups?.count ?? 0),
-                                        sgroups?.baseAddress,
-                                        self.platformOptions.createSession ? 1 : 0
-                                    )
-                                    return (pid, processDescriptor, rc)
-                                }
-                            }
-                        }
-                    }
-                }
-                // Spawn error
-                if spawnError != 0 {
-                    if [ENOENT, EACCES, ENOTDIR].contains(spawnError) {
-                        // Move on to another possible path
-                        continue
-                    }
-                    // Throw all other errors
-                    try self.safelyCloseMultiple(
-                        inputRead: inputReadFileDescriptor,
-                        inputWrite: inputWriteFileDescriptor,
-                        outputRead: outputReadFileDescriptor,
-                        outputWrite: outputWriteFileDescriptor,
-                        errorRead: errorReadFileDescriptor,
-                        errorWrite: errorWriteFileDescriptor
-                    )
-                    throw SubprocessError.spawnFailed(withUnderlyingError: Errno(rawValue: spawnError))
-                }
-                // After spawn finishes, close all child side fds
-                try self.safelyCloseMultiple(
-                    inputRead: inputReadFileDescriptor,
-                    inputWrite: nil,
-                    outputRead: nil,
-                    outputWrite: outputWriteFileDescriptor,
-                    errorRead: nil,
-                    errorWrite: errorWriteFileDescriptor
-                )
-                let execution = Execution(
-                    processIdentifier: .init(
-                        value: pid,
-                        processDescriptor: processDescriptor
-                    )
-                )
-                return SpawnResult(
-                    execution: execution,
-                    inputWriteEnd: inputWriteFileDescriptor?.createIOChannel(),
-                    outputReadEnd: outputReadFileDescriptor?.createIOChannel(),
-                    errorReadEnd: errorReadFileDescriptor?.createIOChannel()
-                )
-            }
-
-            // If we reach this point, it means either the executable path
-            // or working directory is not valid. Since posix_spawn does not
-            // provide which one is not valid, here we make a best effort guess
-            // by checking whether the working directory is valid. This technically
-            // still causes TOUTOC issue, but it's the best we can do for error recovery.
-            try self.safelyCloseMultiple(
-                inputRead: inputReadFileDescriptor,
-                inputWrite: inputWriteFileDescriptor,
-                outputRead: outputReadFileDescriptor,
-                outputWrite: outputWriteFileDescriptor,
-                errorRead: errorReadFileDescriptor,
-                errorWrite: errorWriteFileDescriptor
-            )
-            if let workingDirectory = self.workingDirectory?.string {
-                guard Configuration.pathAccessible(workingDirectory, mode: F_OK) else {
-                    throw SubprocessError.failedToChangeWorkingDirectory(
-                        workingDirectory,
-                        underlyingError: Errno(rawValue: ENOENT)
-                    )
-                }
-            }
-            throw SubprocessError.executableNotFound(
-                self.executable.description,
-                underlyingError: Errno(rawValue: ENOENT)
-            )
-        }
-    }
-}
-
-// MARK:  - ProcessIdentifier
-
-/// A platform-independent identifier for a subprocess.
-public struct ProcessIdentifier: Sendable, Hashable {
-    /// The platform-specific process identifier value.
-    public let value: pid_t
-
-    #if os(Linux) || os(Android) || os(FreeBSD)
-    /// The process file descriptor (pidfd) for the running execution.
-    public let processDescriptor: CInt
-    #else
-    internal let processDescriptor: CInt // not used on other platforms
-    #endif
-
-    internal init(value: pid_t, processDescriptor: PlatformFileDescriptor) {
-        self.value = value
-        self.processDescriptor = processDescriptor
-    }
-
-    internal func close() {
-        if self.processDescriptor > 0 {
-            _ = _subprocess_close(self.processDescriptor)
-        }
-    }
-}
-
-extension ProcessIdentifier: CustomStringConvertible, CustomDebugStringConvertible {
-    /// A textual representation of the process identifier.
-    public var description: String { "\(self.value)" }
-    /// A debug-oriented textual representation of the process identifier.
-    public var debugDescription: String { "\(self.value)" }
-}
-
 // MARK: - Platform Specific Options
 
 /// The collection of platform-specific settings
@@ -634,27 +674,53 @@ extension ProcessIdentifier: CustomStringConvertible, CustomDebugStringConvertib
 public struct PlatformOptions: Sendable {
     /// The user ID for the subprocess.
     public var userID: uid_t? = nil
-    /// The real and effective group ID and the saved
-    /// set-group-ID of the subprocess, equivalent to calling
-    /// `setgid()` on the child process.
+    /// The real, effective, and saved set-group-ID for the subprocess.
     ///
-    /// The group ID controls permissions, particularly
-    /// for file access.
+    /// Setting this value is equivalent to calling `setgid()` on the subprocess.
+    /// The group ID controls permissions, particularly for file access.
     public var groupID: gid_t? = nil
     /// The list of supplementary group IDs for the subprocess.
-    public var supplementaryGroups: [gid_t]? = nil
-    /// The process group for the subprocess, equivalent to
-    /// calling `setpgid()` on the child process.
     ///
-    /// The process group ID groups related processes for
-    /// controlling signals.
+    /// The subprocess either inherits the parent's supplementary groups or
+    /// has them replaced, depending on whether this value is `nil` or an array:
+    ///
+    /// - term `nil`: The subprocess inherits the parent process's
+    ///   supplementary groups unchanged; `setgroups()` isn't called.
+    ///   This is the default.
+    /// - term An empty array (`[]`): The subprocess drops all of the parent's
+    ///   supplementary groups, leaving it with none. This is equivalent to
+    ///   calling `setgroups(0, NULL)` on the subprocess.
+    /// - term A non-empty array: The subprocess's supplementary groups are
+    ///   replaced with exactly the groups in the array; none of the parent's
+    ///   supplementary groups are kept unless they're listed. This is
+    ///   equivalent to calling `setgroups()` with the array's contents on the
+    ///   subprocess.
+    ///
+    /// Any non-`nil` value, including an empty array, requires the privilege
+    /// to call `setgroups()` (typically root); without it, spawning the
+    /// subprocess fails. The supplementary groups are set before ``groupID``
+    /// and ``userID`` are applied.
+    public var supplementaryGroups: [gid_t]? = nil
+    /// The process group for the subprocess.
+    ///
+    /// Equivalent to calling `setpgid()` on the subprocess.
+    /// The process group ID groups related processes for controlling signals.
+    ///
+    /// Whether a `setpgid` failure is reported depends on how the subprocess is
+    /// launched. Where the C library applies it, as part of `posix_spawn`, a
+    /// failure fails the launch and is thrown. Where this package applies it
+    /// itself, in a forked child, it is currently ignored and the subprocess
+    /// launches in the parent's process group instead -- which is the case
+    /// whenever ``userID``, ``groupID`` or ``supplementaryGroups`` is also set,
+    /// when this is combined with ``createSession``, or on a platform whose
+    /// `posix_spawn` cannot express the request.
     public var processGroupID: pid_t? = nil
     /// A Boolean value that indicates whether to create a session
     /// and detach from the terminal.
     public var createSession: Bool = false
-    /// An ordered list of steps to tear down the child
-    /// process if the parent task is canceled before
-    /// the child process terminates.
+    /// An ordered list of steps to tear down the subprocess
+    /// if the calling task is canceled before
+    /// the subprocess terminates.
     ///
     /// The sequence always ends by sending a `.kill` signal.
     public var teardownSequence: [TeardownStep] = []
@@ -688,19 +754,58 @@ extension PlatformOptions: CustomStringConvertible, CustomDebugStringConvertible
 }
 #endif // !canImport(Darwin)
 
+@Sendable
+internal func reapProcess(
+    with processIdentifier: ProcessIdentifier
+) throws(SubprocessError) -> TerminationStatus {
+    do throws(Errno) {
+        // On some platforms, the process exit notification (in particular NOTE_EXIT from kqueue)
+        // may be delivered slightly before the process becomes reapable,
+        // so we must call waitid without WNOHANG to avoid a narrow possibility of a race condition.
+        // If waitid does block, it won't do so for very long at all.
+        let status = try processIdentifier.blockingReap()
+        return status
+    } catch {
+        let subprocessError: SubprocessError = .failedToMonitor(withUnderlyingError: error)
+        throw subprocessError
+    }
+}
+
 extension ProcessIdentifier {
-    /// Reaps the zombie for the exited process. This function may block.
+    /// Reaps the zombie for the exited process.
+    ///
+    /// This function may block.
     @available(*, noasync)
     internal func blockingReap() throws(Errno) -> TerminationStatus {
         try _blockingReap(pid: value)
     }
 
-    /// Reaps the zombie for the exited process, or returns `nil` if the process is still running. This function will not block.
+    /// Reaps the zombie for the exited process, or returns `nil` if the process is still running.
+    ///
+    /// This function does not block.
     internal func reap() throws(Errno) -> TerminationStatus? {
         try _reap(pid: value)
     }
+
+    /// Checks whether the process has already exited without consuming the
+    /// zombie.
+    ///
+    /// Returns `true` if a child has exited (or stopped/continued in a
+    /// way `waitid` reports), `false` if the child is still running.
+    /// The zombie remains available for a subsequent call to `blockingReap()`.
+    internal func peekIfExited() throws(Errno) -> Bool {
+        try _peekIfExited(pid: value)
+    }
 }
 
+// FIXME: once FreeBSD 15.1 can be required, reap a descriptor-backed child with
+// pdwait(2) rather than waitid(P_PID, ...), so the child is reaped through its
+// process descriptor instead of by pid. pdwait fills in a `struct __siginfo`,
+// which is what `TerminationStatus.init(_ siginfo:)` already consumes, so the
+// change is confined to `_blockingReap`, `_reap` and `_peekIfExited`. Added to
+// FreeBSD as syscall 601 in January 2026, with a pdwait.2 manual page and an
+// entry in lib/libsys/Makefile.sys, so it is a first-class userspace wrapper:
+// present in stable/15, absent from releng/15.0.
 @available(*, noasync)
 internal func _blockingReap(pid: pid_t) throws(Errno) -> TerminationStatus {
     let siginfo = try _waitid(idtype: P_PID, id: id_t(pid), flags: WEXITED)
@@ -714,6 +819,13 @@ internal func _reap(pid: pid_t) throws(Errno) -> TerminationStatus? {
         return nil
     }
     return TerminationStatus(siginfo)
+}
+
+internal func _peekIfExited(pid: pid_t) throws(Errno) -> Bool {
+    // WNOWAIT leaves the zombie in the process table so a subsequent
+    // `_blockingReap` (or `_reap`) can still consume it.
+    let siginfo = try _waitid(idtype: P_PID, id: id_t(pid), flags: WEXITED | WNOHANG | WNOWAIT)
+    return !(siginfo.si_pid == 0 && siginfo.si_signo == 0)
 }
 
 internal func _waitid(idtype: idtype_t, id: id_t, flags: Int32) throws(Errno) -> siginfo_t {

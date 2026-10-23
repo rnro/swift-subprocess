@@ -9,7 +9,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-/// Linux AsyncIO implementation based on epoll
+/// Linux AsyncIO implementation based on epoll.
 
 #if os(Linux) || os(Android)
 
@@ -31,16 +31,16 @@ import Musl
 import _SubprocessCShims
 import Synchronization
 
-private typealias SignalStream = AsyncThrowingStream<Bool, any Error>
+// `EPOLLET` (edge-triggered) is the bit `1 << 31` in the Linux epoll ABI, but
+// the C symbol imports inconsistently across libraries.Define the bit directly
+// so it's uniform everywhere.
+private let _EPOLLET: UInt32 = 1 << 31
 private let _epollEventSize = 256
-private let _registration:
-    Mutex<
-        [PlatformFileDescriptor: SignalStream.Continuation]
-    > = Mutex([:])
+private let _registration: Mutex<Registration> = Mutex(Registration())
 
 final class AsyncIO: Sendable {
 
-    typealias OutputStream = AsyncThrowingStream<AsyncBufferSequence.Buffer, any Error>
+    typealias OutputStream = AsyncThrowingStream<SubprocessOutputSequence.Buffer, any Error>
 
     private struct MonitorThreadContext: Sendable {
         let epollFileDescriptor: CInt
@@ -55,15 +55,17 @@ final class AsyncIO: Sendable {
         }
     }
 
-    private enum Event {
-        case read
-        case write
-    }
-
-    private struct State {
+    private struct State: Sendable {
         let epollFileDescriptor: CInt
         let shutdownFileDescriptor: CInt
+        // `pthread_t` is a non-`Sendable` pointer on musl but a `Sendable`
+        // integer on glibc/Bionic; scope the opt-out to musl so it isn't
+        // flagged as unnecessary on the integer platforms.
+        #if canImport(Musl)
+        nonisolated(unsafe) let monitorThread: pthread_t
+        #else
         let monitorThread: pthread_t
+        #endif
     }
 
     static let shared: AsyncIO = AsyncIO()
@@ -72,7 +74,7 @@ final class AsyncIO: Sendable {
     private let shutdownFlag: Atomic<UInt8> = Atomic(0)
 
     internal init() {
-        // Create main epoll fd
+        // Create the main epoll fd.
         let epollFileDescriptor = epoll_create1(CInt(EPOLL_CLOEXEC))
         guard epollFileDescriptor >= 0 else {
             let error: SubprocessError = .asyncIOFailed(
@@ -82,7 +84,7 @@ final class AsyncIO: Sendable {
             self.state = .failure(error)
             return
         }
-        // Create shutdownFileDescriptor
+        // Create the shutdown file descriptor.
         let shutdownFileDescriptor = eventfd(0, CInt(EFD_NONBLOCK | EFD_CLOEXEC))
         guard shutdownFileDescriptor >= 0 else {
             let error: SubprocessError = .asyncIOFailed(
@@ -93,7 +95,7 @@ final class AsyncIO: Sendable {
             return
         }
 
-        // Register shutdownFileDescriptor with epoll
+        // Register the shutdown file descriptor with epoll.
         var event = epoll_event(
             events: EPOLLIN.rawValue,
             data: epoll_data(fd: shutdownFileDescriptor)
@@ -113,19 +115,20 @@ final class AsyncIO: Sendable {
             return
         }
 
-        // Create thread data
+        // Create the thread context.
         let context = MonitorThreadContext(
             epollFileDescriptor: epollFileDescriptor,
             shutdownFileDescriptor: shutdownFileDescriptor
         )
         let thread: pthread_t
-        do {
+        do throws(Errno) {
             thread = try pthread_create {
                 func reportError(_ error: SubprocessError) {
-                    _registration.withLock { store in
-                        for continuation in store.values {
-                            continuation.finish(throwing: error)
-                        }
+                    let continuations = _registration.withLock { store in
+                        return store.allContinuations()
+                    }
+                    for continuation in continuations {
+                        continuation.finish(throwing: error)
                     }
                 }
 
@@ -134,7 +137,7 @@ final class AsyncIO: Sendable {
                     count: _epollEventSize
                 )
 
-                // Enter the monitor loop
+                // Enter the monitor loop.
                 monitorLoop: while true {
                     let eventCount = epoll_wait(
                         context.epollFileDescriptor,
@@ -144,9 +147,9 @@ final class AsyncIO: Sendable {
                     )
                     if eventCount < 0 {
                         if errno == EINTR || errno == EAGAIN {
-                            continue // interrupted by signal; try again
+                            continue // Interrupted by a signal; try again.
                         }
-                        // Report other errors
+                        // Report other errors.
                         let error: SubprocessError = .asyncIOFailed(
                             reason: "epoll_wait failed",
                             underlyingError: Errno(rawValue: errno)
@@ -158,20 +161,21 @@ final class AsyncIO: Sendable {
                     for index in 0..<Int(eventCount) {
                         let event = events[index]
                         let targetFileDescriptor = event.data.fd
-                        // Breakout the monitor loop if we received shutdown
-                        // from the shutdownFD
+                        // Break out of the monitor loop on a shutdown signal
+                        // from `shutdownFileDescriptor`.
                         if targetFileDescriptor == context.shutdownFileDescriptor {
                             var buf: UInt64 = 0
-                            _ = _subprocess_read(context.shutdownFileDescriptor, &buf, MemoryLayout<UInt64>.size)
+                            withUnsafeMutableBytes(of: &buf) { ptr in
+                                _ = try? FileDescriptor(
+                                    rawValue: context.shutdownFileDescriptor
+                                ).read(into: ptr, retryOnInterrupt: true)
+                            }
                             break monitorLoop
                         }
 
-                        // Notify the continuation
+                        // Notify the continuation.
                         let continuation = _registration.withLock { store -> SignalStream.Continuation? in
-                            if let continuation = store[targetFileDescriptor] {
-                                return continuation
-                            }
-                            return nil
+                            return store.continuation(for: targetFileDescriptor)
                         }
                         continuation?.yield(true)
                     }
@@ -204,360 +208,193 @@ final class AsyncIO: Sendable {
         }
 
         guard self.shutdownFlag.add(1, ordering: .sequentiallyConsistent).newValue == 1 else {
-            // We already closed this AsyncIO
+            // This `AsyncIO` was already shut down.
             return
         }
         var one: UInt64 = 1
-        // Wake up the thread for shutdown
-        _ = _subprocess_write(currentState.shutdownFileDescriptor, &one, MemoryLayout<UInt64>.stride)
-        // Cleanup the monitor thread
+        // Wake the monitor thread so it can exit.
+        let shutdownFd = FileDescriptor(rawValue: currentState.shutdownFileDescriptor)
+        let epollFd = FileDescriptor(rawValue: currentState.epollFileDescriptor)
+        withUnsafeBytes(of: &one) { ptr in
+            _ = try? shutdownFd.write(ptr)
+        }
+        // Clean up the monitor thread.
         pthread_join(currentState.monitorThread, nil)
-        var closeError: CInt = 0
-        if _subprocess_close(currentState.epollFileDescriptor) != 0 {
-            closeError = errno
+
+        var closeError: SubprocessError? = nil
+        do {
+            try _safelyClose(.fileDescriptor(epollFd))
+        } catch {
+            closeError = error
         }
-        if _subprocess_close(currentState.shutdownFileDescriptor) != 0 {
-            closeError = errno
+        do {
+            try _safelyClose(.fileDescriptor(shutdownFd))
+        } catch {
+            closeError = error
         }
-        if closeError != 0 {
-            fatalError("Failed to close epollfd: \(String(cString: strerror(closeError)))")
+
+        if let closeError {
+            fatalError("Failed to close epollfd: \(closeError)")
         }
     }
 
-    private func registerFileDescriptor(
+    internal func registerFileDescriptor(
         _ fileDescriptor: FileDescriptor,
+        processIdentifier: ProcessIdentifier,
         for event: Event
-    ) -> SignalStream {
-        return SignalStream { (continuation: SignalStream.Continuation) -> () in
-            // If setup failed, nothing much we can do
-            switch self.state {
-            case .success(let state):
-                // Set file descriptor to be non blocking
-                let flags = fcntl(fileDescriptor.rawValue, F_GETFD)
-                guard flags != -1 else {
-                    let error: SubprocessError = .asyncIOFailed(
-                        reason: "failed to get flags for \(fileDescriptor.rawValue)",
-                        underlyingError: Errno(rawValue: errno)
-                    )
-                    continuation.finish(throwing: error)
-                    return
-                }
-                guard fcntl(fileDescriptor.rawValue, F_SETFL, flags | O_NONBLOCK) != -1 else {
-                    let error: SubprocessError = .asyncIOFailed(
-                        reason: "failed to set \(fileDescriptor.rawValue) to be non-blocking",
-                        underlyingError: Errno(rawValue: errno)
-                    )
-                    continuation.finish(throwing: error)
-                    return
-                }
-                // Register event
-                let targetEvent: EPOLL_EVENTS
-                switch event {
-                case .read:
-                    targetEvent = EPOLL_EVENTS(EPOLLIN)
-                case .write:
-                    targetEvent = EPOLL_EVENTS(EPOLLOUT)
-                }
+    ) -> (stream: SignalStream, outcome: RegistrationOutcome) {
+        // `.bufferingNewest(1)` latches a readiness edge that fires while no
+        // consumer is awaiting, so a wakeup is never dropped between a read's
+        // `EAGAIN` and its `await`.
+        let (stream, continuation) = SignalStream.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
 
-                // Save the continuation (before calling epoll_ctl, so we don't miss any data)
-                _registration.withLock { storage in
-                    storage[fileDescriptor.rawValue] = continuation
-                }
-
-                var event = epoll_event(
-                    events: targetEvent.rawValue,
-                    data: epoll_data(fd: fileDescriptor.rawValue)
-                )
-                let rc = epoll_ctl(
-                    state.epollFileDescriptor,
-                    EPOLL_CTL_ADD,
-                    fileDescriptor.rawValue,
-                    &event
-                )
-                if rc != 0 {
-                    _registration.withLock { storage in
-                        _ = storage.removeValue(forKey: fileDescriptor.rawValue)
-                    }
-
-                    let capturedError = errno
-                    let error: SubprocessError = .asyncIOFailed(
-                        reason: "failed to add \(fileDescriptor.rawValue) to epoll list",
-                        underlyingError: Errno(rawValue: capturedError)
-                    )
-                    continuation.finish(throwing: error)
-                    return
-                }
-            case .failure(let setupError):
-                continuation.finish(throwing: setupError)
-                return
+        // Nothing to do if setup failed.
+        switch self.state {
+        case .failure(let setupError):
+            continuation.finish(throwing: setupError)
+            return (stream, .failed(setupError))
+        case .success(let state):
+            // Set the file descriptor to non-blocking.
+            if let nonBlockingFdError = self.setNonblocking(for: fileDescriptor) {
+                continuation.finish(throwing: nonBlockingFdError)
+                return (stream, .failed(nonBlockingFdError))
             }
+            // Pick the event to register.
+            let targetEvent: EPOLL_EVENTS
+            switch event {
+            case .read:
+                targetEvent = EPOLL_EVENTS(EPOLLIN)
+            case .write:
+                targetEvent = EPOLL_EVENTS(EPOLLOUT)
+            }
+
+            // Hold the lock across both the map insert and `epoll_ctl` so
+            // a concurrent `cancelAsyncIO` either runs entirely before
+            // (in which case `register` returns `.alreadyCancelled`) or
+            // entirely after (in which case it sees the descriptor in the
+            // map and in epoll). Without this, a cancellation could observe
+            // the map entry between `storage.register` and
+            // `epoll_ctl(EPOLL_CTL_ADD)` and try to delete a descriptor
+            // that isn't yet in the epoll set.
+            let outcome: RegistrationOutcome = _registration.withLock { storage in
+                switch storage.register(
+                    fileDescriptor: fileDescriptor.rawValue,
+                    continuation: continuation,
+                    processIdentifier: processIdentifier
+                ) {
+                case .alreadyCancelled:
+                    return .alreadyCancelled
+                case .updated:
+                    // Already attached to epoll by a previous read or write;
+                    // reuse the existing registration and skip the syscall.
+                    return .registered
+                case .registered:
+                    // Register edge-triggered (`EPOLLET`): with a persistent
+                    // registration, `epoll_wait` must report the descriptor
+                    // only when new data arrives, otherwise the monitor thread
+                    // would spin while buffered bytes sit unread between reads.
+                    var event = epoll_event(
+                        events: targetEvent.rawValue | _EPOLLET,
+                        data: epoll_data(fd: fileDescriptor.rawValue)
+                    )
+                    let rc = epoll_ctl(
+                        state.epollFileDescriptor,
+                        EPOLL_CTL_ADD,
+                        fileDescriptor.rawValue,
+                        &event
+                    )
+
+                    if rc != 0 {
+                        let capturedError = errno
+                        _ = storage.removeRegistration(for: fileDescriptor.rawValue)
+                        let error: SubprocessError = .asyncIOFailed(
+                            reason: "failed to add \(fileDescriptor.rawValue) to epoll list",
+                            underlyingError: Errno(rawValue: capturedError)
+                        )
+                        return .failed(error)
+                    }
+                    return .registered
+                }
+            }
+
+            switch outcome {
+            case .registered:
+                break
+            case .alreadyCancelled:
+                continuation.finish()
+            case .failed(let error):
+                continuation.finish(throwing: error)
+            }
+            return (stream, outcome)
         }
     }
 
-    private func removeRegistration(for fileDescriptor: FileDescriptor) throws(SubprocessError) {
+    internal func removeRegistration(for fileDescriptor: FileDescriptor) {
+        let continuation = _registration.withLock { store -> SignalStream.Continuation? in
+            guard
+                let continuation = store.removeRegistration(
+                    for: fileDescriptor.rawValue
+                )
+            else {
+                return nil
+            }
+
+            if case .success(let state) = self.state {
+                _ = epoll_ctl(
+                    state.epollFileDescriptor,
+                    EPOLL_CTL_DEL,
+                    fileDescriptor.rawValue,
+                    nil
+                )
+            }
+            return continuation
+        }
+        continuation?.finish()
+    }
+
+    internal func cancelAsyncIO(for processIdentifier: ProcessIdentifier) throws(SubprocessError) {
         switch self.state {
         case .success(let state):
-            let rc = epoll_ctl(
-                state.epollFileDescriptor,
-                EPOLL_CTL_DEL,
-                fileDescriptor.rawValue,
-                nil
-            )
-            guard rc == 0 else {
-                throw SubprocessError.asyncIOFailed(
-                    reason: "failed to remove \(fileDescriptor.rawValue) from epoll list",
-                    underlyingError: Errno(rawValue: errno)
-                )
+            let cancelledContinuations = try _registration.withLock { storage throws(SubprocessError) -> [SignalStream.Continuation] in
+                let previousRegistrations = storage.cancel(processIdentifier: processIdentifier)
+                guard !previousRegistrations.isEmpty else {
+                    return []
+                }
+                var toBeCancelled: [SignalStream.Continuation] = []
+                for registration in previousRegistrations {
+                    toBeCancelled.append(registration.continuation)
+
+                    let rc = epoll_ctl(
+                        state.epollFileDescriptor,
+                        EPOLL_CTL_DEL,
+                        registration.fileDescriptor,
+                        nil
+                    )
+                    if rc != 0 && errno != ENOENT {
+                        throw SubprocessError.asyncIOFailed(
+                            reason: "failed to remove \(registration.fileDescriptor) from epoll list",
+                            underlyingError: Errno(rawValue: errno)
+                        )
+                    }
+                }
+                return toBeCancelled
             }
-            _registration.withLock { store in
-                _ = store.removeValue(forKey: fileDescriptor.rawValue)
+
+            for c in cancelledContinuations {
+                c.finish()
             }
-        case .failure(let setupFailure):
-            throw setupFailure
+        case .failure(let error):
+            throw error
+        }
+    }
+
+    internal func cleanup(processIdentifier: ProcessIdentifier) {
+        _registration.withLock { storage in
+            storage.remove(processIdentifier: processIdentifier)
         }
     }
 }
-
-extension AsyncIO {
-
-    protocol _ContiguousBytes {
-        var count: Int { get }
-
-        func withUnsafeBytes<ResultType>(
-            _ body: (UnsafeRawBufferPointer) throws -> ResultType
-        ) rethrows -> ResultType
-    }
-
-    func read(
-        from diskIO: borrowing IOChannel,
-        upTo maxLength: Int
-    ) async throws(SubprocessError) -> [UInt8]? {
-        return try await self.read(from: diskIO.channel, upTo: maxLength)
-    }
-
-    func read(
-        from fileDescriptor: FileDescriptor,
-        upTo maxLength: Int
-    ) async throws(SubprocessError) -> [UInt8]? {
-        guard maxLength > 0 else {
-            return nil
-        }
-        // If we are reading until EOF, start with readBufferSize
-        // and gradually increase buffer size
-        let bufferLength = maxLength == .max ? readBufferSize : maxLength
-
-        var resultBuffer: [UInt8] = Array(
-            repeating: 0, count: bufferLength
-        )
-        var readLength: Int = 0
-        let signalStream = self.registerFileDescriptor(fileDescriptor, for: .read)
-
-        do {
-            /// Outer loop: every iteration signals we are ready to read more data
-            for try await _ in signalStream {
-                /// Inner loop: repeatedly call `.read()` and read more data until:
-                /// 1. We reached EOF (read length is 0), in which case return the result
-                /// 2. We read `maxLength` bytes, in which case return the result
-                /// 3. `read()` returns -1 and sets `errno` to `EAGAIN` or `EWOULDBLOCK`. In
-                ///     this case we `break` out of the inner loop and wait `.read()` to be
-                ///     ready by `await`ing the next signal in the outer loop.
-                while true {
-                    let bytesRead = resultBuffer.withUnsafeMutableBufferPointer { bufferPointer in
-                        // Get a pointer to the memory at the specified offset
-                        let targetCount = bufferPointer.count - readLength
-
-                        let offsetAddress = bufferPointer.baseAddress!.advanced(by: readLength)
-
-                        // Read directly into the buffer at the offset
-                        return _subprocess_read(fileDescriptor.rawValue, offsetAddress, targetCount)
-                    }
-                    let capturedErrno = errno
-                    if bytesRead > 0 {
-                        // Read some data
-                        readLength += bytesRead
-                        if maxLength == .max {
-                            // Grow resultBuffer if needed
-                            guard Double(readLength) > 0.8 * Double(resultBuffer.count) else {
-                                continue
-                            }
-                            resultBuffer.append(
-                                contentsOf: Array(repeating: 0, count: resultBuffer.count)
-                            )
-                        } else if readLength >= maxLength {
-                            // When we reached maxLength, return!
-                            try self.removeRegistration(for: fileDescriptor)
-                            return resultBuffer
-                        }
-                    } else if bytesRead == 0 {
-                        // We reached EOF. Return whatever's left
-                        try self.removeRegistration(for: fileDescriptor)
-                        guard readLength > 0 else {
-                            return nil
-                        }
-                        resultBuffer.removeLast(resultBuffer.count - readLength)
-                        return resultBuffer
-                    } else {
-                        if self.shouldWaitForNextSignal(with: capturedErrno) {
-                            // No more data for now wait for the next signal
-                            break
-                        } else {
-                            // Throw all other errors
-                            try self.removeRegistration(for: fileDescriptor)
-                            throw SubprocessError.failedToReadFromProcess(
-                                withUnderlyingError: Errno(rawValue: capturedErrno)
-                            )
-                        }
-                    }
-                }
-            }
-        } catch {
-            // Reset error code to .failedToRead to match other platforms
-            guard let originalError = error as? SubprocessError else {
-                throw SubprocessError.failedToReadFromProcess(
-                    withUnderlyingError: nil
-                )
-            }
-            throw SubprocessError.failedToReadFromProcess(
-                withUnderlyingError: originalError.underlyingError
-            )
-        }
-        resultBuffer.removeLast(resultBuffer.count - readLength)
-        return resultBuffer
-    }
-
-    func write(
-        _ array: [UInt8],
-        to diskIO: borrowing IOChannel
-    ) async throws(SubprocessError) -> Int {
-        return try await self._write(array, to: diskIO)
-    }
-
-    func _write<Bytes: _ContiguousBytes>(
-        _ bytes: Bytes,
-        to diskIO: borrowing IOChannel
-    ) async throws(SubprocessError) -> Int {
-        guard bytes.count > 0 else {
-            return 0
-        }
-        let fileDescriptor = diskIO.channel
-        let signalStream = self.registerFileDescriptor(fileDescriptor, for: .write)
-        var writtenLength: Int = 0
-        do {
-            /// Outer loop: every iteration signals we are ready to read more data
-            for try await _ in signalStream {
-                /// Inner loop: repeatedly call `.write()` and write more data until:
-                /// 1. We've written bytes.count bytes.
-                /// 3. `.write()` returns -1 and sets `errno` to `EAGAIN` or `EWOULDBLOCK`. In
-                ///     this case we `break` out of the inner loop and wait `.write()` to be
-                ///     ready by `await`ing the next signal in the outer loop.
-                while true {
-                    let written = bytes.withUnsafeBytes { ptr in
-                        let remainingLength = ptr.count - writtenLength
-                        let startPtr = ptr.baseAddress!.advanced(by: writtenLength)
-                        return _subprocess_write(fileDescriptor.rawValue, startPtr, remainingLength)
-                    }
-                    let capturedErrno = errno
-                    if written > 0 {
-                        writtenLength += written
-                        if writtenLength >= bytes.count {
-                            // Wrote all data
-                            try self.removeRegistration(for: fileDescriptor)
-                            return writtenLength
-                        }
-                    } else {
-                        if self.shouldWaitForNextSignal(with: capturedErrno) {
-                            // No more data for now wait for the next signal
-                            break
-                        } else {
-                            // Throw all other errors
-                            try self.removeRegistration(for: fileDescriptor)
-                            throw SubprocessError.failedToWriteToProcess(
-                                withUnderlyingError: Errno(rawValue: capturedErrno)
-                            )
-                        }
-                    }
-                }
-            }
-        } catch {
-            // Reset error code to .failedToWrite to match other platforms
-            guard let originalError = error as? SubprocessError else {
-                throw SubprocessError.failedToWriteToProcess(
-                    withUnderlyingError: error as? SubprocessError.UnderlyingError
-                )
-            }
-            throw SubprocessError.failedToWriteToProcess(
-                withUnderlyingError: originalError.underlyingError
-            )
-        }
-        return 0
-    }
-
-    func write(
-        _ span: borrowing RawSpan,
-        to diskIO: borrowing IOChannel
-    ) async throws(SubprocessError) -> Int {
-        guard span.byteCount > 0 else {
-            return 0
-        }
-        let fileDescriptor = diskIO.channel
-        let signalStream = self.registerFileDescriptor(fileDescriptor, for: .write)
-        var writtenLength: Int = 0
-        do {
-            /// Outer loop: every iteration signals we are ready to read more data
-            for try await _ in signalStream {
-                /// Inner loop: repeatedly call `.write()` and write more data until:
-                /// 1. We've written bytes.count bytes.
-                /// 3. `.write()` returns -1 and sets `errno` to `EAGAIN` or `EWOULDBLOCK`. In
-                ///     this case we `break` out of the inner loop and wait `.write()` to be
-                ///     ready by `await`ing the next signal in the outer loop.
-                while true {
-                    let written = span.withUnsafeBytes { ptr in
-                        let remainingLength = ptr.count - writtenLength
-                        let startPtr = ptr.baseAddress!.advanced(by: writtenLength)
-                        return _subprocess_write(fileDescriptor.rawValue, startPtr, remainingLength)
-                    }
-                    let capturedErrno = errno
-                    if written > 0 {
-                        writtenLength += written
-                        if writtenLength >= span.byteCount {
-                            // Wrote all data
-                            try self.removeRegistration(for: fileDescriptor)
-                            return writtenLength
-                        }
-                    } else {
-                        if self.shouldWaitForNextSignal(with: capturedErrno) {
-                            // No more data for now wait for the next signal
-                            break
-                        } else {
-                            // Throw all other errors
-                            try self.removeRegistration(for: fileDescriptor)
-                            throw SubprocessError.failedToWriteToProcess(
-                                withUnderlyingError: Errno(rawValue: capturedErrno)
-                            )
-                        }
-                    }
-                }
-            }
-        } catch {
-            // Reset error code to .failedToWrite to match other platforms
-            guard let originalError = error as? SubprocessError else {
-                throw SubprocessError.failedToWriteToProcess(
-                    withUnderlyingError: error as? SubprocessError.UnderlyingError
-                )
-            }
-            throw SubprocessError.failedToWriteToProcess(
-                withUnderlyingError: originalError.underlyingError
-            )
-        }
-        return 0
-    }
-
-    @inline(__always)
-    private func shouldWaitForNextSignal(with error: CInt) -> Bool {
-        return error == EAGAIN || error == EWOULDBLOCK || error == EINTR
-    }
-}
-
-extension Array: AsyncIO._ContiguousBytes where Element == UInt8 {}
 
 #endif // canImport(Glibc) || canImport(Android) || canImport(Musl)

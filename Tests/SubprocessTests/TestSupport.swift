@@ -31,7 +31,14 @@ import Musl
 /// Instead, globally ignore `SIGPIPE` in tests to prevent us from crashing in this scenario.
 internal let globallyIgnoredSIGPIPE: Bool = {
     #if canImport(Darwin) || canImport(Glibc) || canImport(Bionic) || canImport(Musl)
+    #if canImport(Bionic)
+    // SIG_IGN is a C macro not imported into Swift on Android
+    typealias SignalHandler = @convention(c) (Int32) -> Void
+    let sigIgn = unsafeBitCast(1, to: SignalHandler.self)
+    _ = signal(SIGPIPE, sigIgn)
+    #else
     _ = signal(SIGPIPE, SIG_IGN)
+    #endif
     #endif
     return true
 }()
@@ -89,8 +96,10 @@ extension Trait where Self == ConditionTrait {
     /// This test requires bash to run (instead of sh)
     static var requiresBash: Self {
         enabled(
-            if: (try? Executable.name("bash").resolveExecutablePath(in: .inherit)) != nil,
-            "This test requires bash (install `bash` package on Linux/BSD)"
+            "This test requires bash (install `bash` package on Linux/BSD)",
+            {
+                (try? await Executable.name("bash").resolveExecutablePath(in: .inherit)) != nil
+            }
         )
     }
 }

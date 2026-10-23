@@ -34,6 +34,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <limits.h>
 
@@ -44,6 +45,11 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+
+#if __has_include(<paths.h>)
+// For _PATH_STDPATH / _PATH_DEFPATH
+#include <paths.h>
+#endif
 
 #if __has_include(<crt_externs.h>)
 #include <crt_externs.h>
@@ -56,6 +62,11 @@ extern char **environ;
 
 #if __has_include(<mach/vm_page_size.h>)
 #include <mach/vm_page_size.h>
+#endif
+
+#if TARGET_OS_MAC
+// For posix_spawnattr_set_qos_class_np.
+#include <pthread/spawn.h>
 #endif
 
 int _was_process_exited(int status) {
@@ -78,14 +89,159 @@ int _was_process_suspended(int status) {
     return WIFSTOPPED(status);
 }
 
+uint64_t _subprocess_nofile_soft_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        return 0;
+    }
+    return (uint64_t)rl.rlim_cur;
+}
+
+size_t _subprocess_default_search_path(char * _Nullable buffer, size_t size) {
+    // `confstr(_CS_PATH)` is the POSIX query for the standard path, and is
+    // preferred because the C library answers for the running system. Bionic
+    // only declares it from API level 26, so Android uses its `<paths.h>`
+    // macro instead rather than raising this package's minimum API level.
+#if defined(_CS_PATH) && !defined(__ANDROID__)
+    size_t queried = confstr(_CS_PATH, buffer, size);
+    if (queried > 0) {
+        return queried;
+    }
+#endif
+
+    // Fall back to the standard path fixed at compile time. `_PATH_STDPATH` is
+    // the system utility path on Darwin and the BSDs and with glibc;
+    // `_PATH_DEFPATH` is what Bionic and musl provide.
+#if defined(_PATH_STDPATH)
+    const char *standardPath = _PATH_STDPATH;
+#elif defined(_PATH_DEFPATH)
+    const char *standardPath = _PATH_DEFPATH;
+#else
+    const char *standardPath = NULL;
+#endif
+
+    if (standardPath == NULL) {
+        return 0;
+    }
+    size_t required = strlen(standardPath) + 1;
+    if (buffer != NULL && size > 0) {
+        // Truncate and terminate the way `confstr` does, so the caller can
+        // detect the short buffer from the returned size alone.
+        strncpy(buffer, standardPath, size - 1);
+        buffer[size - 1] = '\0';
+    }
+    return required;
+}
+
 int _subprocess_pthread_create(
+#if TARGET_OS_MAC || defined(__FreeBSD__) || defined(__OpenBSD__) || TARGET_LIBC_MUSL
+    pthread_t _Nullable * _Nonnull ptr,
+#else
     pthread_t * _Nonnull ptr,
+#endif
     pthread_attr_t const * _Nullable attr,
     void * _Nullable (* _Nonnull start)(void * _Nullable),
     void * _Nullable context
 ) {
     return pthread_create(ptr, attr, start, context);
 }
+
+// MARK: - Close-on-exec pipe/dup helpers
+//
+// `pipe2(2)`/`dup3(2)` atomically create/duplicate a descriptor with
+// `O_CLOEXEC` set. A plain `pipe()`/`dup2()` followed by a separate
+// `fcntl(F_SETFD, FD_CLOEXEC)` is not atomic: a `fork()` racing on another
+// thread between the two calls can inherit the not-yet-marked descriptor
+// into an unrelated child this library spawns concurrently. See
+// https://github.com/swiftlang/swift-build/pull/1520 for the same class of
+// fix applied to swift-build.
+//
+// `pipe2`/`dup3` are declared unconditionally on Linux, FreeBSD, and
+// OpenBSD. Darwin does not declare them yet: `<Availability.h>` only
+// defines `__MAC_27_0` once the SDK knows about a macOS release new enough
+// to vend them, so until Xcode ships that SDK we fall back to the
+// non-atomic `pipe()`/`dup2()` + `fcntl(F_SETFD, ...)` sequence there. Once
+// it does, this starts using the atomic syscalls automatically, with no
+// further changes needed here.
+#if TARGET_OS_MAC || TARGET_OS_UNIX
+
+#if TARGET_OS_MAC
+#include <Availability.h>
+
+static int _subprocess_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags == -1) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+static int _subprocess_pipe_fallback(int fildes[2]) {
+    if (pipe(fildes) != 0) {
+        return -1;
+    }
+    if (_subprocess_set_cloexec(fildes[0]) != 0 || _subprocess_set_cloexec(fildes[1]) != 0) {
+        int savedErrno = errno;
+        close(fildes[0]);
+        close(fildes[1]);
+        errno = savedErrno;
+        return -1;
+    }
+    return 0;
+}
+
+static int _subprocess_dup_fallback(int fildes, int fildes2) {
+    if (fildes == fildes2) {
+        // Match dup3(2)'s stricter behavior (EINVAL when old == new) so
+        // callers see consistent semantics regardless of which path is
+        // taken under the hood.
+        errno = EINVAL;
+        return -1;
+    }
+    if (dup2(fildes, fildes2) < 0) {
+        return -1;
+    }
+    if (_subprocess_set_cloexec(fildes2) != 0) {
+        int savedErrno = errno;
+        close(fildes2);
+        errno = savedErrno;
+        return -1;
+    }
+    return fildes2;
+}
+#endif // TARGET_OS_MAC
+
+int _subprocess_pipe_cloexec(int fildes[2]) {
+#if TARGET_OS_MAC
+#if defined(__MAC_27_0)
+    if (__builtin_available(macOS 27, iOS 27, tvOS 27, watchOS 27, visionOS 27, *)) {
+        return pipe2(fildes, O_CLOEXEC);
+    }
+#endif
+    return _subprocess_pipe_fallback(fildes);
+#else // TARGET_OS_UNIX
+    return pipe2(fildes, O_CLOEXEC);
+#endif
+}
+
+int _subprocess_dup3_cloexec(int fildes, int fildes2) {
+#if TARGET_OS_MAC
+#if defined(__MAC_27_0)
+    if (__builtin_available(macOS 27, iOS 27, tvOS 27, watchOS 27, visionOS 27, *)) {
+        return dup3(fildes, fildes2, O_CLOEXEC);
+    }
+#endif
+    return _subprocess_dup_fallback(fildes, fildes2);
+#else // TARGET_OS_UNIX
+    return dup3(fildes, fildes2, O_CLOEXEC);
+#endif
+}
+
+int _subprocess_dup_cloexec(int fildes) {
+    return fcntl(fildes, F_DUPFD_CLOEXEC, 0);
+}
+
+#endif // TARGET_OS_MAC || TARGET_OS_UNIX
 
 #endif
 
@@ -96,29 +252,381 @@ vm_size_t _subprocess_vm_size(void) {
 }
 #endif
 
+#if TARGET_OS_MAC || TARGET_OS_UNIX
+static void _subprocess_reap_pid(pid_t pid) {
+    siginfo_t info;
+    int rc;
+    do {
+        rc = waitid(P_PID, pid, &info, WEXITED);
+    } while (rc == -1 && errno == EINTR);
+}
+#endif
+
+// MARK: - posix_spawn capabilities
+
+#if _POSIX_SPAWN
+
+typedef int (* _subprocess_addclosefrom_t)(posix_spawn_file_actions_t *, int);
+typedef int (* _subprocess_addfchdir_t)(posix_spawn_file_actions_t *, int);
+
+static uint32_t _subprocess_spawn_caps = 0;
+static _subprocess_addclosefrom_t _subprocess_addclosefrom_impl = NULL;
+static _subprocess_addfchdir_t _subprocess_addfchdir_impl = NULL;
+static pthread_once_t _subprocess_spawn_caps_once = PTHREAD_ONCE_INIT;
+
+// Both call sites are behind the corresponding #ifdef, so on a platform that
+// defines neither flag -- FreeBSD and OpenBSD define no POSIX_SPAWN_CLOEXEC_DEFAULT
+// and no POSIX_SPAWN_SETSID -- this would be an unused function warning.
+#if !TARGET_OS_MAC && (defined(POSIX_SPAWN_CLOEXEC_DEFAULT) || defined(POSIX_SPAWN_SETSID))
+/// Whether `posix_spawnattr_setflags` accepts `flag`.
+///
+/// Bionic rejects unknown flags with `EINVAL`, so this detects a pre-Android-13
+/// runtime with no version sniffing at all.
+static int _subprocess_spawnattr_accepts_flag(short flag) {
+    posix_spawnattr_t attrs;
+    if (posix_spawnattr_init(&attrs) != 0) {
+        return 0;
+    }
+    int rc = posix_spawnattr_setflags(&attrs, flag);
+    (void)posix_spawnattr_destroy(&attrs);
+    return rc == 0;
+}
+#endif
+
+static void _subprocess_spawn_caps_init(void) {
+    uint32_t caps = 0;
+
+#if TARGET_OS_MAC
+    // Nothing is probed: the macOS 13 deployment target already covers
+    // POSIX_SPAWN_CLOEXEC_DEFAULT (10.7), POSIX_SPAWN_SETSID (10.12) and
+    // posix_spawn_file_actions_addfchdir_np (10.15).
+    caps |= _SUBPROCESS_SPAWN_CAP_CLOEXEC_DEFAULT;
+    caps |= _SUBPROCESS_SPAWN_CAP_SETSID_FLAG;
+    caps |= _SUBPROCESS_SPAWN_CAP_CHDIR_ACTION;
+
+    // The _np spelling is deprecated as of macOS 26 in favour of
+    // posix_spawn_file_actions_addfchdir, but that replacement is macOS 26+
+    // only, so with a macOS 13 deployment target the _np name is the one that
+    // exists everywhere this runs.
+    //
+    // FIXME: use posix_spawn_file_actions_addfchdir and drop this pragma once
+    // the deployment target can be raised to macOS 26.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    _subprocess_addfchdir_impl = posix_spawn_file_actions_addfchdir_np;
+#pragma clang diagnostic pop
+#else
+    // dlsym rather than a weak symbol reference. glibc versions these symbols
+    // (addclosefrom_np is GLIBC_2.34), and a weak reference to a symbol that
+    // exists at a *newer version* than the one present is not reliably resolved
+    // to NULL, whereas dlsym cannot fail at load time. Uniform across Linux,
+    // Android and the BSDs so no header-version gate is needed either: FreeBSD
+    // grew these actions in 13.1 and OpenBSD has none of them.
+    _subprocess_addclosefrom_impl = (_subprocess_addclosefrom_t)dlsym(
+        RTLD_DEFAULT, "posix_spawn_file_actions_addclosefrom_np"
+    );
+    _subprocess_addfchdir_impl = (_subprocess_addfchdir_t)dlsym(
+        RTLD_DEFAULT, "posix_spawn_file_actions_addfchdir_np"
+    );
+    if (_subprocess_addclosefrom_impl != NULL) {
+        caps |= _SUBPROCESS_SPAWN_CAP_CLOSEFROM_ACTION;
+    }
+    if (_subprocess_addfchdir_impl != NULL) {
+        caps |= _SUBPROCESS_SPAWN_CAP_CHDIR_ACTION;
+    }
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    if (_subprocess_spawnattr_accepts_flag(POSIX_SPAWN_CLOEXEC_DEFAULT)) {
+        caps |= _SUBPROCESS_SPAWN_CAP_CLOEXEC_DEFAULT;
+    }
+#endif
+#ifdef POSIX_SPAWN_SETSID
+    if (_subprocess_spawnattr_accepts_flag(POSIX_SPAWN_SETSID)) {
+        caps |= _SUBPROCESS_SPAWN_CAP_SETSID_FLAG;
+    }
+#endif
+#endif // TARGET_OS_MAC
+
+    _subprocess_spawn_caps = caps;
+}
+
+uint32_t _subprocess_spawn_capabilities(void) {
+    (void)pthread_once(&_subprocess_spawn_caps_once, _subprocess_spawn_caps_init);
+    return _subprocess_spawn_caps;
+}
+
+// `file_actions` is `void *` rather than `posix_spawn_file_actions_t *` because
+// the typedef is a pointer on Darwin, FreeBSD, OpenBSD and Bionic but a struct on
+// glibc and musl. Swift imports a pointer-to-pointer parameter with an optional
+// pointee and a pointer-to-struct parameter with a non-optional one, so no single
+// Swift spelling fits both; an opaque pointer fits both.
+int _subprocess_spawn_addclosefrom(void *file_actions, int from) {
+    // Load-bearing, not defensive: `_subprocess_addclosefrom_impl` is written by
+    // `_subprocess_spawn_caps_init`, and this call is what runs it under the
+    // `pthread_once` that orders that write against the read below. Dropping it
+    // would leave the read racing with initialization.
+    (void)_subprocess_spawn_capabilities();
+    if (_subprocess_addclosefrom_impl == NULL) {
+        return ENOSYS;
+    }
+    return _subprocess_addclosefrom_impl(
+        (posix_spawn_file_actions_t *)file_actions, from
+    );
+}
+
+int _subprocess_spawn_addfchdir(void *file_actions, int fd) {
+    // Load-bearing; see `_subprocess_spawn_addclosefrom` above.
+    (void)_subprocess_spawn_capabilities();
+    if (_subprocess_addfchdir_impl == NULL) {
+        return ENOSYS;
+    }
+    return _subprocess_addfchdir_impl(
+        (posix_spawn_file_actions_t *)file_actions, fd
+    );
+}
+
+// MARK: - Opaque posix_spawn file actions and attributes
+//
+// See the header for why these exist. Each allocates storage for the real
+// typedef and hands back an opaque pointer to it, so Swift never has to name a
+// type whose imported shape differs between libcs.
+
+void *_subprocess_spawn_file_actions_create(int *error) {
+    posix_spawn_file_actions_t *file_actions = malloc(sizeof(*file_actions));
+    if (file_actions == NULL) {
+        *error = ENOMEM;
+        return NULL;
+    }
+    int rc = posix_spawn_file_actions_init(file_actions);
+    if (rc != 0) {
+        free(file_actions);
+        *error = rc;
+        return NULL;
+    }
+    *error = 0;
+    return file_actions;
+}
+
+void _subprocess_spawn_file_actions_free(void *file_actions) {
+    if (file_actions == NULL) {
+        return;
+    }
+    (void)posix_spawn_file_actions_destroy(
+        (posix_spawn_file_actions_t *)file_actions
+    );
+    free(file_actions);
+}
+
+int _subprocess_spawn_file_actions_adddup2(void *file_actions, int fd, int new_fd) {
+    return posix_spawn_file_actions_adddup2(
+        (posix_spawn_file_actions_t *)file_actions, fd, new_fd
+    );
+}
+
+int _subprocess_spawn_file_actions_addclose(void *file_actions, int fd) {
+    return posix_spawn_file_actions_addclose(
+        (posix_spawn_file_actions_t *)file_actions, fd
+    );
+}
+
+void *_subprocess_spawnattr_create(int *error) {
+    posix_spawnattr_t *spawn_attrs = malloc(sizeof(*spawn_attrs));
+    if (spawn_attrs == NULL) {
+        *error = ENOMEM;
+        return NULL;
+    }
+    int rc = posix_spawnattr_init(spawn_attrs);
+    if (rc != 0) {
+        free(spawn_attrs);
+        *error = rc;
+        return NULL;
+    }
+    *error = 0;
+    return spawn_attrs;
+}
+
+void _subprocess_spawnattr_free(void *spawn_attrs) {
+    if (spawn_attrs == NULL) {
+        return;
+    }
+    (void)posix_spawnattr_destroy((posix_spawnattr_t *)spawn_attrs);
+    free(spawn_attrs);
+}
+
+int _subprocess_spawnattr_reset_signals(void *spawn_attrs) {
+    sigset_t no_signals;
+    sigset_t all_signals;
+    if (sigemptyset(&no_signals) != 0) {
+        return errno;
+    }
+    if (sigfillset(&all_signals) != 0) {
+        return errno;
+    }
+    // SIGKILL and SIGSTOP must be excluded, not merely tolerated. Bionic's
+    // POSIX_SPAWN_SETSIGDEF loop calls sigaction() unconditionally for every
+    // member of this set, and Linux rejects sigaction() on those two with
+    // EINVAL even when the disposition asked for is SIG_DFL
+    // (SIG_KERNEL_ONLY_MASK in the kernel's do_sigaction). Bionic then
+    // _exit(127)s the child before it reaches execve, and posix_spawn still
+    // returns 0, so every spawn would look like a program that launched and
+    // exited 127. Excluding them costs nothing anywhere: neither can be caught
+    // or ignored, so neither can have a disposition that needs resetting.
+    // The fork/exec path skips them for the same reason.
+    if (sigdelset(&all_signals, SIGKILL) != 0) {
+        return errno;
+    }
+    if (sigdelset(&all_signals, SIGSTOP) != 0) {
+        return errno;
+    }
+    int rc = posix_spawnattr_setsigmask(
+        (posix_spawnattr_t *)spawn_attrs, &no_signals
+    );
+    if (rc != 0) {
+        return rc;
+    }
+    return posix_spawnattr_setsigdefault(
+        (posix_spawnattr_t *)spawn_attrs, &all_signals
+    );
+}
+
+int _subprocess_spawnattr_setflags(void *spawn_attrs, short flags) {
+    return posix_spawnattr_setflags((posix_spawnattr_t *)spawn_attrs, flags);
+}
+
+int _subprocess_spawnattr_setpgroup(void *spawn_attrs, pid_t pgroup) {
+    return posix_spawnattr_setpgroup((posix_spawnattr_t *)spawn_attrs, pgroup);
+}
+
+#if TARGET_OS_MAC
+int _subprocess_spawnattr_set_qos_class(void *spawn_attrs, int qos_class) {
+    return posix_spawnattr_set_qos_class_np(
+        (posix_spawnattr_t *)spawn_attrs, (qos_class_t)qos_class
+    );
+}
+#endif // TARGET_OS_MAC
+
+int _subprocess_spawn(
+    pid_t * _Nonnull pid,
+    int * _Nonnull pidfd,
+    const char * _Nonnull exec_path,
+    const void * _Nullable file_actions,
+    const void * _Nullable spawn_attrs,
+    char * _Nullable const args[_Nonnull],
+    char * _Nullable const env[_Nullable]
+) {
+    *pidfd = -1;
+    // NULL is meaningful for both: posix_spawn reads it as "no file actions" and
+    // "no attributes".
+    int rc = posix_spawn(
+        pid, exec_path,
+        (const posix_spawn_file_actions_t *)file_actions,
+        (const posix_spawnattr_t *)spawn_attrs,
+        args, env
+    );
+#if TARGET_OS_LINUX
+    if (rc == 0) {
+        // pidfd_open on a child that has not been reaped always succeeds:
+        // pidfd_prepare only reports ESRCH once the task has been reaped, and
+        // nothing reaps our children before we do. A kernel older than 5.3
+        // returns -1, which the caller treats as "monitor by SIGCHLD".
+        *pidfd = _pidfd_open(*pid);
+    }
+#endif
+    return rc;
+}
+
+short _subprocess_spawn_flag_cloexec_default(void) {
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    return (short)POSIX_SPAWN_CLOEXEC_DEFAULT;
+#else
+    return 0;
+#endif
+}
+
+short _subprocess_spawn_flag_setsid(void) {
+#ifdef POSIX_SPAWN_SETSID
+    return (short)POSIX_SPAWN_SETSID;
+#else
+    return 0;
+#endif
+}
+
+short _subprocess_spawn_flags_reset_signals(void) {
+    return (short)(POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF);
+}
+
+short _subprocess_spawn_flag_setpgroup(void) {
+    return (short)POSIX_SPAWN_SETPGROUP;
+}
+
+#endif // _POSIX_SPAWN
+
+// Declared in the header's `!TARGET_OS_WINDOWS` section: Windows has no
+// `O_DIRECTORY` (nor `O_SEARCH`/`O_PATH`), and nothing there opens a directory
+// to `fchdir` from.
+#if !TARGET_OS_WINDOWS
+
+int _subprocess_open_directory_flags(void) {
+#if defined(O_SEARCH)
+    // O_DIRECTORY is explicit: only Darwin defines O_SEARCH as
+    // (O_EXEC | O_DIRECTORY). FreeBSD defines it as plain O_EXEC and musl as
+    // plain O_PATH, so without O_DIRECTORY this would happily open a regular
+    // executable file.
+    return O_SEARCH | O_DIRECTORY | O_CLOEXEC;
+#elif defined(O_PATH)
+    return O_PATH | O_DIRECTORY | O_CLOEXEC;
+#else
+    return O_RDONLY | O_DIRECTORY | O_CLOEXEC;
+#endif
+}
+
+int _subprocess_can_open_directory_for_search(void) {
+#if defined(O_SEARCH) || defined(O_PATH)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int _subprocess_faccessat_eaccess_flag(void) {
+#if defined(__BIONIC__)
+    // Bionic rejects every nonzero flag with EINVAL -- AT_EACCESS included, on
+    // the stated grounds that Android has no set-uid programs and never runs
+    // code with euid != uid. Passing 0 there checks the real IDs instead, which
+    // by that same reasoning is the same answer.
+    return 0;
+#else
+    return AT_EACCESS;
+#endif
+}
+
+#endif // !TARGET_OS_WINDOWS
 
 // MARK: - Darwin (posix_spawn)
 #if TARGET_OS_MAC
-static int _subprocess_spawn_prefork(
+int _subprocess_spawn_prefork(
     pid_t  * _Nonnull  pid,
     const char  * _Nonnull  exec_path,
-    const posix_spawn_file_actions_t _Nullable * _Nonnull file_actions,
-    const posix_spawnattr_t _Nullable * _Nonnull spawn_attrs,
+    const void * _Nullable file_actions,
+    const void * _Nonnull spawn_attrs,
     char * _Nullable const args[_Nonnull],
     char * _Nullable const env[_Nullable],
     uid_t * _Nullable uid,
     gid_t * _Nullable gid,
     int number_of_sgroups, const gid_t * _Nullable sgroups,
-    int create_session
+    int create_session,
+    int number_of_file_action_fds, const int * _Nullable file_action_fds
 ) {
 #define write_error_and_exit int error = errno; \
     write(pipefd[1], &error, sizeof(error));\
     close(pipefd[1]); \
     _exit(EXIT_FAILURE)
 
-    // Set `POSIX_SPAWN_SETEXEC` flag since we are forking ourselves
+    // Set `POSIX_SPAWN_SETEXEC` flag since we are forking ourselves. Unlike
+    // `posix_spawn`, this needs real attributes to add the flag to.
     short flags = 0;
-    int rc = posix_spawnattr_getflags(spawn_attrs, &flags);
+    int rc = posix_spawnattr_getflags(
+        (const posix_spawnattr_t *)spawn_attrs, &flags
+    );
     if (rc != 0) {
         return rc;
     }
@@ -129,35 +637,11 @@ static int _subprocess_spawn_prefork(
     if (rc != 0) {
         return rc;
     }
-    // Setup pipe to catch exec failures from child
+    // Setup pipe to catch exec failures from child. Both ends are marked
+    // close-on-exec atomically (where possible) so a fork() racing on
+    // another thread cannot inherit them into an unrelated child.
     int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        return errno;
-    }
-    // Set FD_CLOEXEC so the pipe is automatically closed when exec succeeds
-    flags = fcntl(pipefd[0], F_GETFD);
-    if (flags == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return errno;
-    }
-    flags |= FD_CLOEXEC;
-    if (fcntl(pipefd[0], F_SETFD, flags) == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return errno;
-    }
-
-    flags = fcntl(pipefd[1], F_GETFD);
-    if (flags == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return errno;
-    }
-    flags |= FD_CLOEXEC;
-    if (fcntl(pipefd[1], F_SETFD, flags) == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
+    if (_subprocess_pipe_cloexec(pipefd) != 0) {
         return errno;
     }
 
@@ -177,11 +661,23 @@ static int _subprocess_spawn_prefork(
         close(pipefd[0]);  // Close unused read end
 
         // Perform setups
-        if (number_of_sgroups > 0 && sgroups != NULL) {
+        // A negative count means "inherit the parent's supplementary groups"
+        // (no setgroups call). Zero is a deliberate request to drop them all
+        // via setgroups(0, NULL).
+        if (number_of_sgroups >= 0) {
             // POSIX doesn't define setgroups (only getgroups) and therefore makes no guarantee of async-signal-safety,
             // but we'll assume in practice it should be async-signal-safe on any reasonable platform based on the fact
             // that getgroups is async-signal-safe.
             if (setgroups(number_of_sgroups, sgroups) != 0) {
+                write_error_and_exit;
+            }
+        }
+
+        // Drop the group before the user. setuid() to a non-root uid clears
+        // the capabilities/privileges, so a following setgid() would fail
+        // with EPERM. https://github.com/swiftlang/swift-subprocess/issues/342
+        if (gid != NULL) {
+            if (setgid(*gid) != 0) {
                 write_error_and_exit;
             }
         }
@@ -192,18 +688,48 @@ static int _subprocess_spawn_prefork(
             }
         }
 
-        if (gid != NULL) {
-            if (setgid(*gid) != 0) {
-                write_error_and_exit;
-            }
-        }
-
         if (create_session != 0) {
             (void)setsid();
         }
 
+        // Clear FD_CLOEXEC on every descriptor the file actions refer to.
+        //
+        // We spawn with POSIX_SPAWN_SETEXEC, which makes posix_spawn() exec
+        // this very process rather than create a new one. In that mode the
+        // exec-time close-on-exec sweep happens before the file actions are
+        // applied, so any close-on-exec descriptor they name is already gone
+        // by the time it is dup2'd/closed and the whole spawn fails with
+        // EBADF. (Verified on macOS 27; happens with or without
+        // POSIX_SPAWN_CLOEXEC_DEFAULT.) The plain posix_spawn() path below
+        // is unaffected, since there the actions are applied in a freshly
+        // forked child before it execs.
+        //
+        // Doing this here rather than in the parent keeps the descriptors
+        // close-on-exec for the parent's lifetime, so a fork() racing on
+        // another thread still cannot leak them; this child is a private
+        // copy that is about to exec. It also does not leak anything into
+        // the exec'd image: POSIX_SPAWN_CLOEXEC_DEFAULT closes every
+        // descriptor the file actions do not explicitly install, and the
+        // parent-side ends are closed outright by addclose actions.
+        for (int i = 0; i < number_of_file_action_fds; i++) {
+            int fd = file_action_fds[i];
+            int fd_flags = fcntl(fd, F_GETFD);
+            if (fd_flags == -1) {
+                write_error_and_exit;
+            }
+            if ((fd_flags & FD_CLOEXEC) != 0
+                && fcntl(fd, F_SETFD, fd_flags & ~FD_CLOEXEC) == -1) {
+                write_error_and_exit;
+            }
+        }
+
         // Use posix_spawnas exec
-        int error = posix_spawn(pid, exec_path, file_actions, spawn_attrs, args, env);
+        int error = posix_spawn(
+            pid, exec_path,
+            (const posix_spawn_file_actions_t *)file_actions,
+            (const posix_spawnattr_t *)spawn_attrs,
+            args, env
+        );
         // If we reached this point, something went wrong
         write(pipefd[1], &error, sizeof(error));
         close(pipefd[1]);
@@ -223,53 +749,28 @@ static int _subprocess_spawn_prefork(
                 // exec worked!
                 close(pipefd[0]);
                 return 0;
-            } else if (read_rc > 0) {
-                // Child exec failed and reported back
-                close(pipefd[0]);
+            }
+            // Capture errno now, before close()/waitid() can overwrite it.
+            int read_errno = errno;
+            if (read_rc < 0 && read_errno == EINTR) {
+                // Interrupted by a signal. Retry the read. Do not reap here;
+                // the child is reaped exactly once below.
+                continue;
+            }
+            // Setup or exec failed and the child has _exit()'d; reap it to
+            // avoid a zombie. The plain (non-prefork) path delegates to
+            // posix_spawn(), which reaps its own child on failure, so only
+            // this manual-fork path needs an explicit reap.
+            _subprocess_reap_pid(childPid);
+            close(pipefd[0]);
+            if (read_rc > 0) {
+                // Child reported its errno back
                 return childError;
             } else {
-                // Read failed
-                if (errno == EINTR) {
-                    continue;
-                } else {
-                    close(pipefd[0]);
-                    return errno;
-                }
+                return read_errno;
             }
         }
     }
-}
-
-int _subprocess_spawn(
-    pid_t  * _Nonnull  pid,
-    const char  * _Nonnull  exec_path,
-    const posix_spawn_file_actions_t _Nullable * _Nonnull file_actions,
-    const posix_spawnattr_t _Nullable * _Nonnull spawn_attrs,
-    char * _Nullable const args[_Nonnull],
-    char * _Nullable const env[_Nullable],
-    uid_t * _Nullable uid,
-    gid_t * _Nullable gid,
-    int number_of_sgroups, const gid_t * _Nullable sgroups,
-    int create_session
-) {
-    int require_pre_fork = uid != NULL ||
-        gid != NULL ||
-        number_of_sgroups > 0 ||
-        create_session > 0;
-
-    if (require_pre_fork != 0) {
-        int rc = _subprocess_spawn_prefork(
-            pid,
-            exec_path,
-            file_actions, spawn_attrs,
-            args, env,
-            uid, gid, number_of_sgroups, sgroups, create_session
-        );
-        return rc;
-    }
-
-    // Spawn
-    return posix_spawn(pid, exec_path, file_actions, spawn_attrs, args, env);
 }
 
 #endif // TARGET_OS_MAC
@@ -347,8 +848,37 @@ struct linux_dirent64 {
 static int _getdents64(int fd, struct linux_dirent64 *dirp, size_t nbytes) {
     return syscall(SYS_getdents64, fd, dirp, nbytes);
 }
+
+// SYS_close_range is only defined on Linux Kernel 5.9 and above.
+// Define our value if it's not available and call the syscall directly because
+// glibc < 2.34 (e.g. Amazon Linux 2) doesn't provide a close_range() wrapper.
+#ifndef SYS_close_range
+#define SYS_close_range 436
 #endif
 
+#ifndef CLOSE_RANGE_CLOEXEC
+#define CLOSE_RANGE_CLOEXEC (1U << 2)
+#endif
+
+static int _close_range(unsigned int first, unsigned int last, unsigned int flags) {
+    return syscall(SYS_close_range, first, last, flags);
+}
+
+int _subprocess_install_sigchld_handler(void (*handler)(int)) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handler;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    sigemptyset(&sa.sa_mask);
+    return sigaction(SIGCHLD, &sa, NULL);
+}
+#endif
+
+// FIXME: once FreeBSD 15.1 can be required, set posix_spawnattr_setprocdescp_np
+// on the posix_spawn path so FreeBSD gets a process descriptor there too, and
+// stops being the one platform where preferring posix_spawn costs the
+// descriptor. Added to FreeBSD in January 2026: present in stable/15, absent
+// from releng/15.0.
 static pid_t _subprocess_pdfork(int *fdp) {
 #if TARGET_OS_LINUX
     return _clone3(fdp); // CLONE_PIDFD always sets close-on-exec on the fd
@@ -490,6 +1020,32 @@ static int _highest_possibly_open_fd(void) {
     return sysconf(_SC_OPEN_MAX);
 }
 
+// Binds `fd` to the standard descriptor `target` in a child that is about to
+// exec, returning a negative value on failure.
+//
+// Normally this is just dup2(), which is what we want: it clears
+// close-on-exec on the descriptor it creates, regardless of whether `fd`
+// itself is close-on-exec, so the bound stream survives the exec. The one
+// case it does not cover is fd == target, where dup2() is a no-op that
+// leaves the existing flags untouched. That can happen when the parent had
+// this standard descriptor closed and the pipe was allocated over it, and
+// since these pipes are created close-on-exec it would otherwise leave the
+// child's standard stream closed after exec. Clear the flag explicitly
+// there. Both dup2() and fcntl() are async-signal-safe.
+static int _subprocess_bind_standard_fd(int fd, int target) {
+    if (fd != target) {
+        return dup2(fd, target);
+    }
+    int flags = fcntl(target, F_GETFD);
+    if (flags == -1) {
+        return -1;
+    }
+    if ((flags & FD_CLOEXEC) != 0 && fcntl(target, F_SETFD, flags & ~FD_CLOEXEC) == -1) {
+        return -1;
+    }
+    return target;
+}
+
 int _subprocess_fork_exec(
     pid_t * _Nonnull pid,
     int * _Nonnull pidfd,
@@ -509,35 +1065,11 @@ int _subprocess_fork_exec(
     close(pipefd[1]); \
     _exit(EXIT_FAILURE)
 
-    // Setup pipe to catch exec failures from child
+    // Setup pipe to catch exec failures from child. Both ends are marked
+    // close-on-exec atomically (where possible) so a fork() racing on
+    // another thread cannot inherit them into an unrelated child.
     int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        return errno;
-    }
-    // Set FD_CLOEXEC so the pipe is automatically closed when exec succeeds
-    short flags = fcntl(pipefd[0], F_GETFD);
-    if (flags == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return errno;
-    }
-    flags |= FD_CLOEXEC;
-    if (fcntl(pipefd[0], F_SETFD, flags) == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return errno;
-    }
-
-    flags = fcntl(pipefd[1], F_GETFD);
-    if (flags == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return errno;
-    }
-    flags |= FD_CLOEXEC;
-    if (fcntl(pipefd[1], F_SETFD, flags) == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
+    if (_subprocess_pipe_cloexec(pipefd) != 0) {
         return errno;
     }
 
@@ -552,6 +1084,7 @@ int _subprocess_fork_exec(
     if (rc != 0) {
         close(pipefd[0]);
         close(pipefd[1]);
+        pthread_mutex_unlock(&_subprocess_fork_lock);
         return errno;
     }
 
@@ -570,6 +1103,7 @@ int _subprocess_fork_exec(
             // Report all other errors
             close(pipefd[0]);
             close(pipefd[1]);
+            pthread_mutex_unlock(&_subprocess_fork_lock);
             return errno;
         }
     }
@@ -578,6 +1112,7 @@ int _subprocess_fork_exec(
         // Fork failed
         close(pipefd[0]);
         close(pipefd[1]);
+        pthread_mutex_unlock(&_subprocess_fork_lock);
         return errno;
     }
 
@@ -615,7 +1150,10 @@ int _subprocess_fork_exec(
             }
         }
 
-        if (number_of_sgroups > 0 && sgroups != NULL) {
+        // A negative count means "inherit the parent's supplementary groups"
+        // (no setgroups call). Zero is a deliberate request to drop them all
+        // via setgroups(0, NULL).
+        if (number_of_sgroups >= 0) {
             // POSIX doesn't define setgroups (only getgroups) and therefore makes no guarantee of async-signal-safety,
             // but we'll assume in practice it should be async-signal-safe on any reasonable platform based on the fact
             // that getgroups is async-signal-safe.
@@ -624,14 +1162,17 @@ int _subprocess_fork_exec(
             }
         }
 
-        if (uid != NULL) {
-            if (setuid(*uid) != 0) {
+        // Drop the group before the user. setuid() to a non-root uid clears
+        // the capabilities/privileges, so a following setgid() would fail
+        // with EPERM. https://github.com/swiftlang/swift-subprocess/issues/342
+        if (gid != NULL) {
+            if (setgid(*gid) != 0) {
                 write_error_and_exit;
             }
         }
 
-        if (gid != NULL) {
-            if (setgid(*gid) != 0) {
+        if (uid != NULL) {
+            if (setuid(*uid) != 0) {
                 write_error_and_exit;
             }
         }
@@ -644,9 +1185,11 @@ int _subprocess_fork_exec(
             (void)setpgid(0, *process_group_id);
         }
 
-        // Bind stdin, stdout, and stderr
+        // Bind stdin, stdout, and stderr. See _subprocess_bind_standard_fd
+        // for why this is dup2-based rather than _subprocess_dup3_cloexec:
+        // these descriptors must survive the execve() below.
         if (file_descriptors[0] >= 0) {
-            rc = dup2(file_descriptors[0], STDIN_FILENO);
+            rc = _subprocess_bind_standard_fd(file_descriptors[0], STDIN_FILENO);
         } else {
             rc = close(STDIN_FILENO);
         }
@@ -655,7 +1198,7 @@ int _subprocess_fork_exec(
         }
 
         if (file_descriptors[2] >= 0) {
-            rc = dup2(file_descriptors[2], STDOUT_FILENO);
+            rc = _subprocess_bind_standard_fd(file_descriptors[2], STDOUT_FILENO);
         } else {
             rc = close(STDOUT_FILENO);
         }
@@ -664,7 +1207,7 @@ int _subprocess_fork_exec(
         }
 
         if (file_descriptors[4] >= 0) {
-            rc = dup2(file_descriptors[4], STDERR_FILENO);
+            rc = _subprocess_bind_standard_fd(file_descriptors[4], STDERR_FILENO);
         } else {
             rc = close(STDERR_FILENO);
         }
@@ -674,7 +1217,11 @@ int _subprocess_fork_exec(
         // Close all other file descriptors
         rc = -1;
         errno = ENOSYS;
-        #if (__has_include(<linux/close_range.h>) && (!defined(__ANDROID__) || __ANDROID_API__  >= 34)) || defined(__FreeBSD__)
+        #if defined(__linux__)
+        // We must NOT close pipefd[1] for writing errors
+        rc = _close_range(STDERR_FILENO + 1, pipefd[1] - 1, CLOSE_RANGE_CLOEXEC);
+        rc |= _close_range(pipefd[1] + 1, ~0U, CLOSE_RANGE_CLOEXEC);
+        #elif defined(__FreeBSD__)
         // We must NOT close pipefd[1] for writing errors
         rc = close_range(STDERR_FILENO + 1, pipefd[1] - 1, CLOSE_RANGE_CLOEXEC);
         rc |= close_range(pipefd[1] + 1, ~0U, CLOSE_RANGE_CLOEXEC);
@@ -712,8 +1259,7 @@ int _subprocess_fork_exec(
     } else {
 #define reap_child_process_and_return_errno int capturedError = errno; \
     close(pipefd[0]); \
-    siginfo_t info; \
-    waitid(P_PID, childPid, &info, WEXITED); \
+    _subprocess_reap_pid(childPid); \
     return capturedError
 
 #if TARGET_OS_LINUX
@@ -730,6 +1276,7 @@ int _subprocess_fork_exec(
         // Restore old signmask
         rc = pthread_sigmask(SIG_SETMASK, &old_sigmask, NULL);
         if (rc != 0) {
+            pthread_mutex_unlock(&_subprocess_fork_lock);
             reap_child_process_and_return_errno;
         }
 
@@ -750,24 +1297,22 @@ int _subprocess_fork_exec(
                 close(pipefd[0]);
                 return 0;
             }
-            // if we reach this point, exec failed.
-            // Since we already have the child pid (fork succeed), reap the child
-            // This mimic posix_spawn behavior
-            siginfo_t info;
-            waitid(P_PID, childPid, &info, WEXITED);
-
+            // Capture errno now, before close()/waitid() can overwrite it.
+            int read_errno = errno;
+            if (read_rc < 0 && read_errno == EINTR) {
+                // Interrupted by a signal. Retry the read. Do not reap here;
+                // the child is reaped exactly once below.
+                continue;
+            }
+            // exec failed. Reap the child (mimics posix_spawn, which reaps on
+            // exec failure) using the pid from the successful fork.
+            _subprocess_reap_pid(childPid);
+            close(pipefd[0]);
             if (read_rc > 0) {
-                // Child exec failed and reported back
-                close(pipefd[0]);
+                // Child exec failed and reported its errno back
                 return childError;
             } else {
-                // Read failed
-                if (errno == EINTR) {
-                    continue;
-                } else {
-                    close(pipefd[0]);
-                    return errno;
-                }
+                return read_errno;
             }
         }
     }
@@ -844,7 +1389,7 @@ BOOL _subprocess_windows_send_vm_close(
     return FALSE;
 }
 
-unsigned int _subprocess_windows_get_errno(void) {
+errno_t _subprocess_windows_get_errno(void) {
     return errno;
 }
 

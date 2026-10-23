@@ -19,14 +19,11 @@ public import Foundation
 public import FoundationEssentials
 #endif
 
-/// An output type that collects the subprocess's output as `Data`.
+/// An output type that collects the subprocess's output as binary data.
 public struct DataOutput: OutputProtocol, ErrorOutputProtocol {
-    /// The output type for this output option.
     public typealias OutputType = Data
-    /// The maximum number of bytes to collect.
     public let maxSize: Int
 
-    /// Creates data from a raw span.
     public func output(from span: RawSpan) throws(SubprocessError) -> Data {
         return Data(span)
     }
@@ -37,10 +34,9 @@ public struct DataOutput: OutputProtocol, ErrorOutputProtocol {
 }
 
 extension OutputProtocol where Self == DataOutput {
-    /// Creates a subprocess output that collects output as `Data`,
-    /// up to `limit` bytes.
+    /// Creates a subprocess output that collects the process's binary output, up to the specified byte limit.
     ///
-    /// The subprocess throws an error if the child process
+    /// `run` throws a ``SubprocessError`` if the process
     /// produces more bytes than `limit`.
     public static func data(limit: Int) -> Self {
         return .init(limit: limit)
@@ -48,9 +44,9 @@ extension OutputProtocol where Self == DataOutput {
 }
 
 extension Data {
-    /// Creates a `Data` value from a buffer.
+    /// Creates a binary data value from a subprocess output buffer.
     /// - Parameter buffer: The buffer to copy from.
-    public init(buffer: AsyncBufferSequence.Buffer) {
+    public init(buffer: SubprocessOutputSequence.Buffer) {
         self = Data(buffer.data)
     }
 }

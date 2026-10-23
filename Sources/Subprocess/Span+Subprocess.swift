@@ -37,37 +37,20 @@ public func _overrideLifetime<
     dependent
 }
 
-extension Span where Element: BitwiseCopyable {
+extension Array where Element: BitwiseCopyable {
+    // swift-format-ignore
+    // Access the storage backing this Buffer
     internal var _bytes: RawSpan {
-        @_lifetime(copy self)
-        @_alwaysEmitIntoClient
-        get {
-            let rawSpan = RawSpan(_elements: self)
-            return _overrideLifetime(of: rawSpan, copyingFrom: self)
+        // `Array.span` (SE-0456) is gated to macOS 26 and does not back-deploy,
+        // but Subprocess deploys to macOS 13, so hand-roll the `RawSpan`. There
+        // is no back-deployed `Array.span`. Replace with `self.span.bytes` once
+        // the deployment floor reaches macOS 26.
+        @_lifetime(borrow self)
+        borrowing get {
+            let ptr = self.withUnsafeBytes { $0 }
+            let bytes = RawSpan(_unsafeBytes: ptr)
+            return _overrideLifetime(of: bytes, to: self)
         }
     }
 }
-
-#if canImport(Glibc) || canImport(Bionic) || canImport(Musl)
-internal import Dispatch
-
-extension DispatchData {
-    var bytes: RawSpan {
-        _read {
-            if self.count == 0 {
-                let empty = UnsafeRawBufferPointer(start: nil, count: 0)
-                let span = RawSpan(_unsafeBytes: empty)
-                yield _overrideLifetime(of: span, to: self)
-            } else {
-                // FIXME: We cannot get a stable ptr out of DispatchData.
-                // For now revert back to copy
-                let array = Array(self)
-                let ptr = array.withUnsafeBytes { return $0 }
-                let span = RawSpan(_unsafeBytes: ptr)
-                yield _overrideLifetime(of: span, to: self)
-            }
-        }
-    }
-}
-#endif  // canImport(Glibc) || canImport(Bionic) || canImport(Musl)
 
